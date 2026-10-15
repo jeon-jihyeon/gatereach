@@ -1,0 +1,140 @@
+#!/bin/sh
+# Finds or fetches the gatereach binary of this plugin's version and runs it with the given arguments
+# 1. `<home>/bin/v<version>/gatereach` when a previous run fetched or built it
+# 2. the GitHub release of that version for this OS and architecture, verified against its `checksums.txt`
+# 3. go install of the same version when Go is present and the release couldn't be fetched
+# 4. another gatereach on PATH when it answers the plugin version
+# Home is GATEREACH_HOME, else ~/.gatereach
+# The version comes from the plugin manifest, so the plugin and the binary it runs never drift
+set -eu
+
+REPO="jeon-jihyeon/gatereach"
+# Seconds a failed fetch and build are skipped, so calls before a release don't each pay for the network
+MISS_TTL=600
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+MANIFEST="${ROOT}/.claude-plugin/plugin.json"
+
+version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -n 1)
+if [ -z "$version" ]; then
+  echo "gatereach: no version in ${MANIFEST}" >&2
+  exit 1
+fi
+if [ -n "${GATEREACH_HOME:-}" ]; then
+  HOME_DIR="$GATEREACH_HOME"
+elif [ -n "${HOME:-}" ]; then
+  HOME_DIR="${HOME}/.gatereach"
+else
+  echo "gatereach: neither GATEREACH_HOME nor HOME is set, so there's nowhere to keep the binary" >&2
+  exit 1
+fi
+TAG="v${version}"
+BIN_DIR="${HOME_DIR}/bin/${TAG}"
+BIN="${BIN_DIR}/gatereach"
+MISS="${BIN_DIR}/.miss"
+
+if [ -x "$BIN" ]; then
+  exec "$BIN" "$@"
+fi
+
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+case "$arch" in
+  x86_64) arch=amd64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+esac
+ARCHIVE="gatereach_${os}_${arch}.tar.gz"
+BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d ' ' -f 1
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d ' ' -f 1
+    return
+  fi
+  return 1
+}
+
+# Returns 1 when the release can't be fetched, so the next source is tried
+# 1. a checksum mismatch exits, because the download can't be trusted
+# 2. the binary is unpacked in a temp directory and renamed, so the cached path never holds a partial file
+fetch() {
+  command -v curl >/dev/null 2>&1 || return 1
+  tmp=$(mktemp -d "${BIN_DIR}/.fetch.XXXXXX") || return 1
+  if ! curl -fsSL --connect-timeout 5 --max-time 60 "${BASE_URL}/${ARCHIVE}" -o "${tmp}/${ARCHIVE}" 2>/dev/null ||
+    ! curl -fsSL --connect-timeout 5 --max-time 30 "${BASE_URL}/checksums.txt" -o "${tmp}/checksums.txt" 2>/dev/null; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! got=$(sha256 "${tmp}/${ARCHIVE}") || [ -z "$got" ]; then
+    echo "gatereach: can't compute the sha256 of ${ARCHIVE} with sha256sum or shasum, so it isn't trusted" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  want=$(awk -v f="$ARCHIVE" '$2 == f { print $1 }' "${tmp}/checksums.txt")
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    echo "gatereach: checksum of ${BASE_URL}/${ARCHIVE} doesn't match checksums.txt, refusing to run it" >&2
+    rm -rf "$tmp"
+    exit 1
+  fi
+  if ! tar -xzf "${tmp}/${ARCHIVE}" -C "$tmp" gatereach || ! chmod +x "${tmp}/gatereach" || ! mv -f "${tmp}/gatereach" "$BIN"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  rm -rf "$tmp"
+  echo "gatereach: fetched ${BASE_URL}/${ARCHIVE} into ${BIN}" >&2
+}
+
+# go install writes its target in place, so it builds into a temp directory that's renamed like a fetch
+build() {
+  command -v go >/dev/null 2>&1 || return 1
+  echo "gatereach: couldn't fetch release ${TAG} for ${os}/${arch}, building with go install" >&2
+  tmp=$(mktemp -d "${BIN_DIR}/.build.XXXXXX") || return 1
+  if ! GOBIN="$tmp" go install "github.com/${REPO}/cmd/gatereach@${TAG}" || ! mv -f "${tmp}/gatereach" "$BIN"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  rm -rf "$tmp"
+}
+
+# True while the last failed fetch and build are younger than MISS_TTL
+missed() {
+  [ -f "$MISS" ] || return 1
+  at=$(cat "$MISS" 2>/dev/null || true)
+  now=$(date +%s)
+  case "$at" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ $((now - at)) -lt "$MISS_TTL" ]
+}
+
+if ! missed; then
+  if mkdir -p "$BIN_DIR" 2>/dev/null; then
+    if fetch || build; then
+      rm -f "$MISS"
+      exec "$BIN" "$@"
+    fi
+    date +%s >"$MISS" 2>/dev/null || true
+  fi
+fi
+
+# Physical directory and file name, so a PATH entry that reaches this launcher by another spelling is recognized
+real() {
+  dir=$(CDPATH='' cd -P -- "$(dirname -- "$1")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$dir" "$(basename -- "$1")"
+}
+
+# command -v may name this launcher itself when the plugin bin directory is on PATH
+found=$(command -v gatereach 2>/dev/null || true)
+if [ -n "$found" ] && [ "$(real "$found")" != "$(real "$0")" ]; then
+  have=$("$found" --version 2>/dev/null || echo unknown)
+  if [ "$have" = "$version" ]; then
+    exec "$found" "$@"
+  fi
+  echo "gatereach: ${found} on PATH is version ${have} but the plugin needs ${version}" >&2
+fi
+
+echo "gatereach: couldn't fetch ${TAG} from ${BASE_URL} or build it with Go. Install Go from https://go.dev/dl, or put a gatereach ${version} binary on PATH. The next try comes after ${MISS_TTL} seconds, or delete ${MISS} to try now" >&2
+exit 1

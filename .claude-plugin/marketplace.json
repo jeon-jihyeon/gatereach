@@ -1,0 +1,14 @@
+{
+  "name": "gatereach",
+  "description": "Claude Code plugin for querying data sources behind tunnels and credentials",
+  "owner": {
+    "name": "jeon-jihyeon"
+  },
+  "plugins": [
+    {
+      "name": "gatereach",
+      "source": "./",
+      "description": "Query MySQL, Redis, DynamoDB and Kafka behind tunnels or credentials through saved aliases, read only by default, as JSON lines or a Data Package"
+    }
+  ]
+}

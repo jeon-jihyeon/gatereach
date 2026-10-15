@@ -1,0 +1,30 @@
+# build output
+# bin/gatereach is the committed launcher, so only the root binary is ignored
+/dist/
+/gatereach
+*.test
+*.prof
+cover.out
+
+# saved query results
+/out/
+/*.arrows
+/datapackage.json
+
+# local notes and settings
+.claude/settings.local.json
+CLAUDE.local.md
+/tmp/
+
+# a real config copied in for testing
+/conns.toml
+
+# environment
+.env*
+!.env.example
+
+# editors and the OS
+.vscode
+.idea
+*.swp
+.DS_Store

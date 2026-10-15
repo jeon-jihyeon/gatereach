@@ -1,0 +1,34 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        # Close has no useful error to act on once the work is done or has already failed
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*net.UnixConn).Close
+        - (*net.UnixListener).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Conn).Close
+        - (*database/sql.Rows).Close
+        - (*github.com/redis/go-redis/v9.Client).Close
+        - (github.com/jeon-jihyeon/gatereach/internal/clients.Client).Close
+        # Remove calls clean up on a best effort basis, and a file that's already gone is fine
+        - os.Remove
+        - os.RemoveAll
+        # A print to the terminal that fails has nowhere else to report
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Printf
+    staticcheck:
+      checks:
+        - all
+        # Korean messages may start with a product name such as Keychain or MySQL
+        - -ST1005
+        # Doc comments follow the Korean comment rules, not the English Name form these checks expect
+        - -ST1020
+        - -ST1021
+        - -ST1022

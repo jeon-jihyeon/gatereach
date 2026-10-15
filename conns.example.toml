@@ -1,0 +1,50 @@
+# $XDG_CONFIG_HOME/gatereach/conns.toml
+# ~/.config is used when XDG_CONFIG_HOME isn't set
+# GATEREACH_CONFIG points to a different file
+
+# Tunnel tool settings, needed only when the defaults don't fit
+# bin is the tsh to run when tsh isn't on PATH
+# home sets TELEPORT_HOME, so tsh uses the profile Teleport Connect keeps
+# [tunnels.tsh]
+# bin = "/opt/homebrew/bin/tsh"
+# home = "~/Library/Application Support/Teleport Connect/tsh"
+
+# MySQL through a Teleport tunnel
+# gatereach add picks this fixed port from the target and user when --port is left out
+# It falls between 20000 and 31999
+[conns.orders-staging]
+client = "mysql"
+host = "127.0.0.1"
+port = 26344
+user = "viewer"
+# database = "orders"
+# tls = true
+
+[conns.orders-staging.tunnel]
+type = "tsh"
+target = "orders-staging"
+
+# Redis reached directly, password read from the macOS Keychain
+[conns.cache-local]
+client = "redis"
+host = "127.0.0.1"
+port = 6379
+secret = "keychain:cache-local"
+# user = "reader"
+# tls = true
+
+# DynamoDB through an AWS profile, no host or port
+[conns.events-ddb]
+client = "dynamodb"
+profile = "dev"
+region = "ap-northeast-2"
+
+# Kafka with SASL
+# A secret switches on SASL_SSL with PLAIN and needs a user
+# Without a secret, tls = true still turns on TLS
+[conns.events-kafka]
+client = "kafka"
+host = "broker.example.com"
+port = 9092
+user = "api-key"
+secret = "env:EVENTS_KAFKA_SECRET"
