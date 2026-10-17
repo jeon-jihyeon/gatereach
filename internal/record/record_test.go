@@ -1,11 +1,11 @@
 package record_test
 
 import (
+	"math"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/jeon-jihyeon/gatereach/internal/record"
 )
@@ -21,9 +21,18 @@ func TestJSON(t *testing.T) {
 		{"keeps field order", []string{"b", "a"}, []any{int64(1), "x"}, `{"b":1,"a":"x"}`},
 		{"null apart from the string NULL", []string{"a", "b"}, []any{nil, "NULL"}, `{"a":null,"b":"NULL"}`},
 		{"float keeps a decimal point", []string{"f"}, []any{1.0}, `{"f":1.0}`},
-		{"non-ASCII and HTML kept", []string{"s"}, []any{"한글<&>"}, `{"s":"한글<&>"}`},
-		{"control characters escaped", []string{"s"}, []any{"a\"\\\n\t\x01"}, `{"s":"a\"\\\n\t\u0001"}`},
-		{"nested map sorted", []string{"m"}, []any{map[string]any{"z": int64(1), "a": []any{true, nil}}}, `{"m":{"a":[true,null],"z":1}}`},
+		{"non-ASCII and HTML kept", []string{"s"}, []any{"café<&>"}, `{"s":"café<&>"}`},
+		{"control characters escaped", []string{"s"}, []any{"a\"\\\n\r\t\x01\x1f"}, `{"s":"a\"\\\n\r\t\u0001\u001f"}`},
+		{"invalid UTF-8 replaced between valid runs", []string{"s"}, []any{"é\xffa\xc3"}, `{"s":"é` + "�" + `a` + "�" + `"}`},
+		{"C1 controls escaped", []string{"s"}, []any{"a\u0080b\u009f"}, `{"s":"a\u0080b\u009f"}`},
+		{"line and paragraph separators escaped", []string{"s"}, []any{"a\u2028b\u2029"}, `{"s":"a\u2028b\u2029"}`},
+		{"bidi controls escaped", []string{"s"}, []any{"\u202a\u202e\u2066\u2069\u200e\u200f\u061c"},
+			`{"s":"\u202a\u202e\u2066\u2069\u200e\u200f\u061c"}`},
+		{"runes next to the escaped ranges kept", []string{"s"}, []any{"\u00a0\u2027\u202f\u2065\u206a\u200d"},
+			`{"s":"` + "\u00a0\u2027\u202f\u2065\u206a\u200d" + `"}`},
+		{"NaN is null", []string{"f"}, []any{math.NaN()}, `{"f":null}`},
+		{"nested map sorted", []string{"m"}, []any{map[string]any{"z": int64(1), "a": []any{true, nil}}},
+			`{"m":{"a":[true,null],"z":1}}`},
 		{"int normalized", []string{"n"}, []any{7}, `{"n":7}`},
 		{"unknown type written as text", []string{"t"}, []any{time.Duration(1)}, `{"t":"1ns"}`},
 	}
@@ -48,21 +57,23 @@ func TestFromJSON(t *testing.T) {
 		want want
 	}{
 		{"round trip keeps order and types", `{"z":"x","a":{"k":2.5},"f":3.0,"i":9007199254740993,"n":null}`,
-			want{names: []string{"z", "a", "f", "i", "n"}, values: []any{"x", map[string]any{"k": 2.5}, 3.0, int64(9007199254740993), nil}}},
+			want{
+				names:  []string{"z", "a", "f", "i", "n"},
+				values: []any{"x", map[string]any{"k": 2.5}, 3.0, int64(9007199254740993), nil},
+			}},
 		{"integer past int64 stays a string", `{"n":123456789012345678901234567890}`,
 			want{names: []string{"n"}, values: []any{"123456789012345678901234567890"}}},
+		{"number past float64 stays a string", `{"n":1e400}`, want{names: []string{"n"}, values: []any{"1e400"}}},
 		{"not an object", `[1]`, want{err: true}},
 		{"broken JSON", `{"a":`, want{err: true}},
+		{"object without its closing brace", `{"a":1`, want{err: true}},
+		{"data after the object", `{"a":1}{"b":2}`, want{err: true}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got, err := record.FromJSON([]byte(tc.in))
-			if tc.want.err {
-				assert.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
+			assert.Equal(t, tc.want.err, err != nil, "%v", err)
 			assert.Equal(t, tc.want.names, got.Names())
 			assert.Equal(t, tc.want.values, got.Values())
 		})
@@ -99,6 +110,8 @@ func TestUniqueNames(t *testing.T) {
 	}{
 		{"suffixes repeats", []string{"id", "id", "name", "id"}, []string{"id", "id_2", "name", "id_3"}},
 		{"keeps distinct names", []string{"a", "b"}, []string{"a", "b"}},
+		{"a suffix skips a name already in the list", []string{"id", "id", "id_2"}, []string{"id", "id_3", "id_2"}},
+		{"a suffixed repeat gets its own suffix", []string{"a", "a_2", "a", "a_2"}, []string{"a", "a_2", "a_3", "a_2_2"}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,7 +23,7 @@ import (
 
 var meta = sinks.Meta{
 	Version: "0.1.0", Alias: "db", Client: "mysql", User: "viewer", Query: "select 1", Limit: 10,
-	Started: time.Date(2026, 10, 15, 10, 0, 0, 0, time.FixedZone("KST", 9*3600)),
+	Started: time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC),
 }
 
 func r(names []string, values ...any) record.Record { return record.New(names, values) }
@@ -54,32 +55,67 @@ func readArrow(t *testing.T, path string) (*arrow.Schema, []arrow.RecordBatch) {
 	return rd.Schema(), out
 }
 
+// A closed file fails every write like a full disk
+func closedFile(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "out"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	return f
+}
+
 func TestJSONLines(t *testing.T) {
 	t.Parallel()
 	type want struct {
-		out, err string
+		// What stdout holds before Close
+		early       string
+		out, stderr string
+		closeErr    bool
 	}
-	tcs := []struct {
-		name   string
+	type args struct {
 		follow bool
+		broken bool
+		single bool
 		runErr error
-		want   want
+	}
+	lines := "{\"a\":\"café\"}\n{\"raw\":1}\n"
+	tcs := []struct {
+		name string
+		args args
+		want want
 	}{
-		{"one line per record and a count", false, nil, want{"{\"a\":\"한글\"}\n", "(1 rows)\n"}},
-		{"a failure is noted", true, errors.New("x"), want{"{\"a\":\"한글\"}\n", "(1 rows, 실패로 중단)\n"}},
+		{"one line per record and a count", args{},
+			want{out: lines, stderr: "(2 rows)\n"}},
+		{"follow flushes every record and a failed run is noted", args{follow: true, runErr: errors.New("x")},
+			want{early: lines, out: lines, stderr: "(2 rows, stopped by a failure)\n"}},
+		{"a failed output is noted and returned", args{broken: true},
+			want{stderr: "(2 rows, stopped by a failure)\n", closeErr: true}},
+		{"one record is counted as a row", args{single: true},
+			want{out: "{\"a\":\"café\"}\n", stderr: "(1 row)\n"}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var out, errw bytes.Buffer
+			var w io.Writer = &out
+			if tc.args.broken {
+				w = closedFile(t)
+			}
 			m := meta
-			m.Follow = tc.follow
-			s, err := sinks.Get("", "arrow", m, &out, &errw)
+			m.Follow = tc.args.follow
+			s, err := sinks.Get("", "arrow", m, w, &errw)
 			require.NoError(t, err)
-			require.NoError(t, s.Write(r([]string{"a"}, "한글")))
-			require.NoError(t, s.Close(tc.runErr))
+			require.NoError(t, s.Write(r([]string{"a"}, "café")))
+			if !tc.args.single {
+				raw, ok := s.(sinks.RawWriter)
+				require.True(t, ok)
+				require.NoError(t, raw.WriteRaw([]byte(`{"raw":1}`)))
+			}
+			assert.Equal(t, tc.want.early, out.String())
+			closeErr := s.Close(tc.args.runErr)
+			assert.Equal(t, tc.want.closeErr, closeErr != nil, "%v", closeErr)
 			assert.Equal(t, tc.want.out, out.String())
-			assert.Equal(t, tc.want.err, errw.String())
+			assert.Equal(t, tc.want.stderr, errw.String())
 		})
 	}
 }
@@ -94,9 +130,11 @@ func TestGet(t *testing.T) {
 		errText  string
 		stderr   string
 		rows     []float64
-		// arrow 형식에서 열 이름별 타입
+		// Arrow type per column name
 		types map[string]string
-		// csv 형식의 파일 내용
+		// Values of the arrow column s with nil for NULL
+		s []any
+		// File content in the csv format
 		csv string
 	}
 	tcs := []struct {
@@ -108,15 +146,40 @@ func TestGet(t *testing.T) {
 	}{
 		{"arrow keeps types and nulls", "arrow", []record.Record{typed, nulls}, nil, want{
 			complete: true, rows: []float64{2},
-			types: map[string]string{"i": "int64", "f": "float64", "s": "utf8", "b": "bool", "o": "extension<arrow.json[storage_type=utf8]>"},
+			types: map[string]string{
+				"i": "int64",
+				"f": "float64",
+				"s": "utf8",
+				"b": "bool",
+				"o": "extension<arrow.json[storage_type=utf8]>",
+			},
+			s: []any{"NULL", nil},
 		}},
-		{"csv marks null and writes nested values as JSON", "csv", []record.Record{r([]string{"n", "a", "f"}, nil, []any{int64(1), "x"}, 2.0)}, nil, want{
-			complete: true, rows: []float64{1}, csv: "n,a,f\n\\N,\"[1,\"\"x\"\"]\",2.0\n",
+		{
+			"csv marks null and writes nested values as JSON",
+			"csv",
+			[]record.Record{r([]string{"n", "a", "f", "b", "i"}, nil, []any{int64(1), "x"}, 2.0, true, int64(3))},
+			nil,
+			want{
+				complete: true, rows: []float64{1}, csv: "n,a,f,b,i\n\\N,\"[1,\"\"x\"\"]\",2.0,true,3\n",
+			},
+		},
+		{
+			"a failed run keeps rows and marks the package incomplete",
+			"arrow",
+			[]record.Record{r([]string{"a"}, int64(1))},
+			errors.New("tool failed"),
+			want{
+				errText: "tool failed", stderr: "stopped by a failure, saved only what arrived", rows: []float64{1},
+			},
+		},
+		{"an empty csv run writes one empty resource", "csv", nil, nil, want{complete: true, rows: []float64{0}, csv: ""}},
+		{"an empty arrow run is a readable stream", "arrow", nil, nil, want{
+			complete: true, rows: []float64{0}, types: map[string]string{},
 		}},
-		{"a failed run keeps rows and marks the package incomplete", "arrow", []record.Record{r([]string{"a"}, int64(1))}, errors.New("tool failed"), want{
-			errText: "tool failed", stderr: "실패로 중단되어 받은 데까지만 저장", rows: []float64{1},
-		}},
-		{"an empty run still writes one resource", "csv", nil, nil, want{complete: true, rows: []float64{0}, csv: "\n"}},
+		{"fields in another order or missing land in their columns", "csv", []record.Record{
+			r([]string{"a", "b"}, "1", "2"), r([]string{"b", "a"}, "3", "4"), r([]string{"a"}, "5"),
+		}, nil, want{complete: true, rows: []float64{3}, csv: "a,b\n1,2\n4,3\n5,\\N\n"}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -133,7 +196,7 @@ func TestGet(t *testing.T) {
 			d := readDescriptor(t, dir)
 			run := d["gatereach"].(map[string]any)
 			assert.Equal(t, tc.want.complete, run["complete"])
-			assert.Equal(t, tc.want.errText, or(run["error"]))
+			assert.Equal(t, tc.want.errText, text(run["error"]))
 			assert.Contains(t, errw.String(), tc.want.stderr)
 			if tc.want.complete {
 				assert.Equal(t, filepath.Join(dir, "datapackage.json")+"\n", out.String())
@@ -156,12 +219,11 @@ func TestGet(t *testing.T) {
 				}
 				assert.Equal(t, tc.want.types, types)
 				gm, _ := schema.Metadata().GetValue("gatereach")
-				assert.Equal(t, `{"version":"0.1.0","alias":"db","client":"mysql","user":"viewer","query":"select 1","limit":10,"write":false,"follow":false,"started":"2026-10-15T10:00:00+09:00"}`, gm)
-				col := batches[0].Column(2).(*array.String)
-				assert.Equal(t, "NULL", col.Value(0))
-				assert.True(t, col.IsNull(1), "NULL apart from the string NULL")
+				assert.Equal(t, `{"version":"0.1.0","alias":"db","client":"mysql","user":"viewer","query":"select 1",`+
+					`"limit":10,"write":false,"follow":false,"started":"2026-10-15T10:00:00+00:00"}`, gm)
+				assert.Equal(t, tc.want.s, stringColumn(schema, batches, "s"))
 			}
-			if tc.want.csv != "" {
+			if tc.format == "csv" {
 				b, err := os.ReadFile(filepath.Join(dir, "result.csv"))
 				require.NoError(t, err)
 				assert.Equal(t, tc.want.csv, string(b))
@@ -170,25 +232,58 @@ func TestGet(t *testing.T) {
 	}
 }
 
-func or(v any) string {
+func stringColumn(schema *arrow.Schema, batches []arrow.RecordBatch, name string) []any {
+	idx := schema.FieldIndices(name)
+	if len(idx) == 0 {
+		return nil
+	}
+	var out []any
+	for _, b := range batches {
+		col := b.Column(idx[0]).(*array.String)
+		for j := range col.Len() {
+			if col.IsNull(j) {
+				out = append(out, nil)
+				continue
+			}
+			out = append(out, col.Value(j))
+		}
+	}
+	return out
+}
+
+func text(v any) string {
 	if s, ok := v.(string); ok {
 		return s
 	}
 	return ""
 }
 
-func TestGet_에러(t *testing.T) {
+// A link to an empty folder and a dangling link are both refused
+func links(t *testing.T) (toEmpty, dangling string) {
+	t.Helper()
+	dir := t.TempDir()
+	toEmpty, dangling = filepath.Join(dir, "link"), filepath.Join(dir, "dangling")
+	require.NoError(t, os.Symlink(t.TempDir(), toEmpty))
+	require.NoError(t, os.Symlink(filepath.Join(dir, "missing"), dangling))
+	return toEmpty, dangling
+}
+
+func TestGet_Errors(t *testing.T) {
 	t.Parallel()
 	full := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(full, "x"), nil, 0o600))
+	toEmpty, dangling := links(t)
 	tcs := []struct {
 		name   string
 		dir    string
 		format string
 		err    string
 	}{
-		{"non-empty folder", full, "arrow", "비어 있지 않은 폴더"},
-		{"unknown format", filepath.Join(t.TempDir(), "out"), "parquet", "지원하지 않는 형식"},
+		{"non-empty folder", full, "arrow", "folder not empty"},
+		{"a file in place of the folder", filepath.Join(full, "x"), "csv", "couldn't read the folder"},
+		{"unknown format", filepath.Join(t.TempDir(), "out"), "parquet", "unsupported format"},
+		{"a link to an empty folder", toEmpty, "arrow", "folder is a symlink"},
+		{"a dangling link", dangling, "csv", "folder is a symlink"},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -203,6 +298,7 @@ func TestCheckFolder(t *testing.T) {
 	t.Parallel()
 	full := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(full, "x"), nil, 0o600))
+	toEmpty, dangling := links(t)
 	tcs := []struct {
 		name   string
 		folder string
@@ -211,7 +307,10 @@ func TestCheckFolder(t *testing.T) {
 		{"stdout needs no folder", "", ""},
 		{"missing folder", filepath.Join(t.TempDir(), "out"), ""},
 		{"empty folder", t.TempDir(), ""},
-		{"non-empty folder", full, "비어 있지 않은 폴더"},
+		{"non-empty folder", full, "folder not empty"},
+		{"a file in place of the folder", filepath.Join(full, "x"), "couldn't read the folder"},
+		{"a link to an empty folder", toEmpty, "folder is a symlink"},
+		{"a dangling link", dangling, "folder is a symlink"},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -221,4 +320,18 @@ func TestCheckFolder(t *testing.T) {
 			assert.Contains(t, fmt.Sprint(err), tc.err)
 		})
 	}
+}
+
+// An empty folder made by someone else ends up private like a new one
+func TestGet_ExistingEmptyFolderBecomesPrivate(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	require.NoError(t, os.Chmod(dir, 0o755))
+	s, err := sinks.Get(dir, "csv", meta, &bytes.Buffer{}, &bytes.Buffer{})
+	require.NoError(t, err)
+	require.NoError(t, s.Close(nil))
+	fi, err := os.Stat(dir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), fi.Mode().Perm())
 }

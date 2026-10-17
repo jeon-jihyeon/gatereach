@@ -25,7 +25,7 @@ func descriptorOf(t *testing.T, dir string) map[string]any {
 	return d
 }
 
-// 묶음 크기 1로 두 번째 레코드가 새 필드를 가져와 구간을 바꿈
+// With a batch size of 1 the second record brings a new field and starts a new segment
 func TestNewFieldStartsSegmentWithoutLoss(t *testing.T) {
 	t.Parallel()
 	for _, format := range []string{"arrow", "csv"} {
@@ -64,7 +64,8 @@ func TestLingerFlushesALoneRecord(t *testing.T) {
 	}, 2*time.Second, 50*time.Millisecond)
 }
 
-// 쓰기 실패는 이후 Write와 Close에 남아 호출자가 0이 아닌 코드로 끝냄
+// A write failure sticks to later Write and Close calls so the caller exits non-zero
+// A folder that can't take the temp file keeps the first descriptor
 func TestWriteErrorSticks(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "out")
@@ -76,4 +77,63 @@ func TestWriteErrorSticks(t *testing.T) {
 	require.Error(t, first)
 	assert.Equal(t, first, p.Write(record.New([]string{"a"}, []any{"y"})))
 	assert.Error(t, p.Close(nil))
+	assert.Equal(t, notFinished, descriptorOf(t, dir)["gatereach"].(map[string]any)["error"])
+}
+
+// The folder holds a partial descriptor from the start and only the final one after Close
+func TestDescriptorIsPartialUntilClose(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "out")
+	p, err := newPackage(dir, "csv", testMeta, &bytes.Buffer{}, &bytes.Buffer{}, 1000, time.Hour)
+	require.NoError(t, err)
+	first := descriptorOf(t, dir)
+	run := first["gatereach"].(map[string]any)
+	assert.Equal(t, false, run["complete"])
+	assert.Equal(t, notFinished, run["error"])
+	assert.Empty(t, first["resources"])
+
+	require.NoError(t, p.Write(record.New([]string{"a"}, []any{"x"})))
+	require.NoError(t, p.Close(nil))
+	final := descriptorOf(t, dir)["gatereach"].(map[string]any)
+	assert.Equal(t, true, final["complete"])
+	assert.NotContains(t, final, "error")
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.Equal(t, []string{"datapackage.json", "result.csv"}, names, "no temp file is left")
+	fi, err := os.Stat(filepath.Join(dir, "datapackage.json"))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(fileMode), fi.Mode().Perm())
+}
+
+// A link planted where a segment goes fails the write and leaves its target alone
+// The final descriptor carries the write error
+func TestSegmentRefusesAPlantedLink(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "out")
+	target := filepath.Join(t.TempDir(), "target")
+	require.NoError(t, os.WriteFile(target, []byte("keep"), 0o600))
+	p, err := newPackage(dir, "csv", testMeta, &bytes.Buffer{}, &bytes.Buffer{}, 1, time.Hour)
+	require.NoError(t, err)
+	require.NoError(t, os.Symlink(target, filepath.Join(dir, "result.csv")))
+	writeErr := p.Write(record.New([]string{"a"}, []any{"x"}))
+	require.Error(t, writeErr)
+	assert.Equal(t, writeErr, p.Close(nil))
+	run := descriptorOf(t, dir)["gatereach"].(map[string]any)
+	assert.Equal(t, false, run["complete"])
+	assert.Equal(t, writeErr.Error(), run["error"])
+	b, err := os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, "keep", string(b))
+}
+
+// A folder swapped for a link after the check is refused when it's opened
+func TestMakeFolderRefusesALink(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.Symlink(t.TempDir(), dir))
+	assert.ErrorContains(t, makeFolder(dir), "couldn't read the folder")
 }

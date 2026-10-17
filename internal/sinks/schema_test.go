@@ -27,6 +27,11 @@ func TestInfer(t *testing.T) {
 		want    FieldType
 	}{
 		{"integers", values(int64(1), big), nil, TypeInteger},
+		{"a lone big integer", values(big), nil, TypeInteger},
+		{"strings and nulls", values("x", nil), nil, TypeString},
+		{"booleans", values(true), nil, TypeBoolean},
+		{"objects", values(map[string]any{}), nil, TypeObject},
+		{"arrays", values([]any{}), nil, TypeArray},
 		{"integer and float", values(int64(1), 0.5), nil, TypeNumber},
 		{"big integer and float stay exact", values(0.5, big), nil, TypeAny},
 		{"only nulls", values(nil), nil, TypeAny},
@@ -55,7 +60,8 @@ func TestFits(t *testing.T) {
 		{"a large integer never lands in a float column", values(int64(1) << 60), []Field{{"v", TypeNumber}}, false},
 		{"a small integer fits a float column", values(int64(3)), []Field{{"v", TypeNumber}}, true},
 		{"null fits any column", values(nil), []Field{{"v", TypeBoolean}}, true},
-		{"a new field does not fit", []record.Record{record.New([]string{"w"}, []any{"x"})}, []Field{{"v", TypeString}}, false},
+		{"a new field does not fit", []record.Record{record.New([]string{"w"}, []any{"x"})}, []Field{{"v", TypeString}},
+			false},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {

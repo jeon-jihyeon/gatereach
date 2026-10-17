@@ -2,6 +2,7 @@ package clients
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"testing"
@@ -11,18 +12,30 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/jeon-jihyeon/gatereach/internal/config"
 	"github.com/jeon-jihyeon/gatereach/internal/record"
 )
 
-// 인메모리 Kafka 클러스터와 그 위의 연결된 클라이언트
+// An in-memory Kafka cluster and a client connected to it
 func kafkaCluster(t *testing.T, topics ...string) (*kafkaClient, string) {
+	t.Helper()
+	cluster := fakeCluster(t, topics...)
+	addr := cluster.ListenAddrs()[0]
+	return kafkaConnect(t, addr), addr
+}
+
+func fakeCluster(t *testing.T, topics ...string) *kfake.Cluster {
 	t.Helper()
 	cluster, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(2, topics...))
 	require.NoError(t, err)
 	t.Cleanup(cluster.Close)
-	addr := cluster.ListenAddrs()[0]
+	return cluster
+}
+
+func kafkaConnect(t *testing.T, addr string) *kafkaClient {
+	t.Helper()
 	host, port, err := net.SplitHostPort(addr)
 	require.NoError(t, err)
 	p, err := strconv.Atoi(port)
@@ -32,14 +45,18 @@ func kafkaCluster(t *testing.T, topics ...string) (*kafkaClient, string) {
 	defer cancel()
 	require.NoError(t, k.Connect(ctx))
 	t.Cleanup(func() { _ = k.Close() })
-	return k, addr
+	return k
 }
 
-// 파티션마다 n건 생산
-// transactional이면 트랜잭션으로 커밋해 커밋 마커가 끝에 남음
+// Produces n records per partition
+// transactional commits them in a transaction so a commit marker ends the log
 func produce(t *testing.T, addr, topic string, n int, transactional bool) {
 	t.Helper()
-	opts := []kgo.Opt{kgo.SeedBrokers(addr), kgo.DefaultProduceTopic(topic), kgo.RecordPartitioner(kgo.ManualPartitioner())}
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(addr),
+		kgo.DefaultProduceTopic(topic),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+	}
 	if transactional {
 		opts = append(opts, kgo.TransactionalID("tx-"+topic))
 	}
@@ -87,7 +104,7 @@ func TestKafkaRead(t *testing.T) {
 		transactional bool
 		query         string
 		limit         int
-		// 같은 클라이언트로 반복해 읽는 횟수
+		// How many times the same client reads
 		reads int
 		want  want
 	}{
@@ -97,7 +114,7 @@ func TestKafkaRead(t *testing.T) {
 		{"ends past a transaction commit marker", 3, true, "events", 100, 1, want{rows: 6}},
 		{"empty topic ends at once", 0, false, "events", 100, 1, want{rows: 0}},
 		{"topics lists metadata", 0, false, "topics", 100, 1, want{rows: 1}},
-		{"missing topic fails", 0, false, "missing", 100, 1, want{err: "missing"}},
+		{"missing topic fails", 0, false, "missing", 100, 1, want{err: "no such kafka topic: missing"}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,15 +127,76 @@ func TestKafkaRead(t *testing.T) {
 				got, err := collect(t, func(ctx context.Context, emit Emit) error {
 					return k.Read(ctx, Query{Text: tc.query, Limit: tc.limit}, emit)
 				})
-				if tc.want.err != "" {
-					assert.ErrorContains(t, err, tc.want.err)
-					return
-				}
-				require.NoError(t, err)
-				assert.Len(t, got, tc.want.rows)
+				assert.Equal(t, tc.want, want{rows: len(got), err: errText(err)})
 			}
 		})
 	}
+}
+
+// A compacted topic can end in a gap with no record left at its end
+// The broker here reports an end past the last record to make that gap
+// 1. The idle wait ends the sample with what it read
+// 2. A context that ends first returns its error so Run reports a timeout instead of a full sample
+func TestKafkaReadEndsInAGap(t *testing.T) {
+	t.Parallel()
+	type want struct {
+		rows int
+		err  error
+	}
+	tcs := []struct {
+		name string
+		idle time.Duration
+		// How long the read's context lasts
+		wait time.Duration
+		want want
+	}{
+		{"the idle wait ends the sample", 200 * time.Millisecond, 5 * time.Second, want{rows: 6}},
+		{"a context that ends first keeps its error", time.Minute, time.Second,
+			want{rows: 6, err: context.DeadlineExceeded}},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			k := kafkaGap(t)
+			k.idle = tc.idle
+			ctx, cancel := context.WithTimeout(context.Background(), tc.wait)
+			defer cancel()
+			rows := 0
+			err := k.Read(ctx, Query{Text: "events", Limit: 100}, func(record.Record) error {
+				rows++
+				return nil
+			})
+			assert.Equal(t, tc.want, want{rows: rows, err: err})
+		})
+	}
+}
+
+// A client on a cluster whose 3 records per partition end before the reported end of 5
+func kafkaGap(t *testing.T) *kafkaClient {
+	t.Helper()
+	cluster := fakeCluster(t, "events")
+	addr := cluster.ListenAddrs()[0]
+	produce(t, addr, "events", 3, false)
+	cluster.ControlKey(int16(kmsg.ListOffsets), func(kreq kmsg.Request) (kmsg.Response, error, bool) {
+		req := kreq.(*kmsg.ListOffsetsRequest)
+		if req.Topics[0].Partitions[0].Timestamp != -1 {
+			return nil, nil, false
+		}
+		resp := req.ResponseKind().(*kmsg.ListOffsetsResponse)
+		for _, rt := range req.Topics {
+			st := kmsg.NewListOffsetsResponseTopic()
+			st.Topic = rt.Topic
+			for _, rp := range rt.Partitions {
+				sp := kmsg.NewListOffsetsResponseTopicPartition()
+				sp.Partition = rp.Partition
+				sp.Offset = 5
+				st.Partitions = append(st.Partitions, sp)
+			}
+			resp.Topics = append(resp.Topics, st)
+		}
+		return resp, nil, true
+	})
+	return kafkaConnect(t, addr)
 }
 
 func TestKafkaFollow(t *testing.T) {
@@ -146,7 +224,86 @@ func TestKafkaFollow(t *testing.T) {
 	assert.False(t, handled, "topics falls back to polling")
 }
 
-// 바이너리 payload는 대체 문자로 잃지 않고 base64
+// Follow in the shape of Read so a table can hold both
+func kafkaFollow(k *kafkaClient, ctx context.Context, q Query, emit Emit) error {
+	_, err := k.Follow(ctx, q, emit)
+	return err
+}
+
+// Each emitted record pays 1 and the record that reaches the budget is still emitted
+func TestKafkaUse(t *testing.T) {
+	t.Parallel()
+	type want struct {
+		used    []float64
+		emitted int
+		err     error
+	}
+	tcs := []struct {
+		name  string
+		query string
+		read  func(k *kafkaClient, ctx context.Context, q Query, emit Emit) error
+		// The total at which Use returns ErrBudget
+		max  float64
+		want want
+	}{
+		{"a sample pays per record", "events", (*kafkaClient).Read, 100, want{used: []float64{1, 1, 1, 1}, emitted: 4}},
+		{"a sample stops at the budget", "events", (*kafkaClient).Read, 3,
+			want{used: []float64{1, 1, 1}, emitted: 3, err: ErrBudget}},
+		{"topics pays per row", "topics", (*kafkaClient).Read, 100, want{used: []float64{1}, emitted: 1}},
+		{"a follow ends at the budget", "events", kafkaFollow, 2, want{used: []float64{1, 1}, emitted: 2, err: ErrBudget}},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			k, addr := kafkaCluster(t, "events")
+			produce(t, addr, "events", 2, false)
+			var used []float64
+			total := 0.0
+			q := Query{Text: tc.query, Limit: 10, Use: func(amount float64) error {
+				used = append(used, amount)
+				if total += amount; total >= tc.max {
+					return ErrBudget
+				}
+				return nil
+			}}
+			got, err := collect(t, func(ctx context.Context, emit Emit) error { return tc.read(k, ctx, q, emit) })
+			assert.Equal(t, tc.want, want{used: used, emitted: len(got), err: err})
+		})
+	}
+}
+
+// An emit that fails ends the read at that record
+func TestKafkaEmitStops(t *testing.T) {
+	t.Parallel()
+	emitErr := errors.New("sink closed")
+	tcs := []struct {
+		name  string
+		query string
+		read  func(k *kafkaClient, ctx context.Context, q Query, emit Emit) error
+	}{
+		{"a sample", "events", (*kafkaClient).Read},
+		{"topics", "topics", (*kafkaClient).Read},
+		{"a follow", "events", kafkaFollow},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			k, addr := kafkaCluster(t, "events")
+			produce(t, addr, "events", 2, false)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			emitted := 0
+			err := tc.read(k, ctx, Query{Text: tc.query, Limit: 10}, func(record.Record) error {
+				emitted++
+				return emitErr
+			})
+			assert.ErrorIs(t, err, emitErr)
+			assert.Equal(t, 1, emitted)
+		})
+	}
+}
+
+// A binary payload becomes base64 instead of being lost to replacement characters
 func TestKafkaRecord(t *testing.T) {
 	t.Parallel()
 	ts := time.UnixMilli(1700000000000)
@@ -155,12 +312,15 @@ func TestKafkaRecord(t *testing.T) {
 		msg  *kgo.Record
 		want string
 	}{
-		{"text stays a string", &kgo.Record{Topic: "t", Key: []byte("k"), Value: []byte("값"), Timestamp: ts,
+		{"text stays a string", &kgo.Record{Topic: "t", Key: []byte("k"), Value: []byte("café"), Timestamp: ts,
 			Headers: []kgo.RecordHeader{{Key: "h", Value: []byte("v")}}},
-			`{"topic":"t","partition":0,"offset":0,"timestamp":1700000000000,"key":"k","value":"값","headers":[{"key":"h","value":"v"}]}`},
-		{"binary becomes base64", &kgo.Record{Topic: "t", Key: []byte{0xff}, Value: []byte{0x00, 0xfe, 0x01}, Timestamp: ts,
-			Headers: []kgo.RecordHeader{{Key: "h", Value: []byte{0xc3}}}},
-			`{"topic":"t","partition":0,"offset":0,"timestamp":1700000000000,"key":"/w==","value":"AP4B","headers":[{"key":"h","value":"ww=="}]}`},
+			`{"topic":"t","partition":0,"offset":0,"timestamp":1700000000000,"key":"k","value":"café","headers":[{"key":"h","value":"v"}]}`},
+		{
+			"binary becomes base64",
+			&kgo.Record{Topic: "t", Key: []byte{0xff}, Value: []byte{0x00, 0xfe, 0x01}, Timestamp: ts,
+				Headers: []kgo.RecordHeader{{Key: "h", Value: []byte{0xc3}}}},
+			`{"topic":"t","partition":0,"offset":0,"timestamp":1700000000000,"key":"/w==","value":"AP4B","headers":[{"key":"h","value":"ww=="}]}`,
+		},
 		{"missing key and value are null", &kgo.Record{Topic: "t", Timestamp: ts},
 			`{"topic":"t","partition":0,"offset":0,"timestamp":1700000000000,"key":null,"value":null,"headers":[]}`},
 	}

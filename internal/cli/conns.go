@@ -17,9 +17,9 @@ import (
 )
 
 var tunnelMessages = map[tunnels.Result]string{
-	tunnels.Already: "이미 열림",
-	tunnels.Foreign: "다른 프로세스가 연 포트 사용",
-	tunnels.Opened:  "열림",
+	tunnels.Already: "already open",
+	tunnels.Foreign: "port held by another process",
+	tunnels.Opened:  "opened",
 }
 
 func (a *app) ls([]string) error {
@@ -44,14 +44,14 @@ func (a *app) ls([]string) error {
 		if session.Alive(alias) {
 			live = "live"
 		}
-		fmt.Fprintf(a.stdout, "%-24s %-8s %-22s %-10s %-5s %-6s %s\n", alias, or(c.Client, "?"), or(where, "-"), or(c.User, "-"), tunnel, state, live)
+		fmt.Fprintf(a.stdout, "%-24s %-8s %-22s %-10s %-5s %-6s %s\n",
+			clean(alias), clean(or(c.Client, "?")), clean(or(where, "-")), clean(or(c.User, "-")), clean(tunnel), state, live)
 	}
 	return nil
 }
 
-// 터널과 세션 준비
-// 터널 결과와 세션을 새로 시작했는지 반환
-// 세션이 살아 있고 포트가 열려 있으면 프로세스 목록 확인을 건너뜀
+// Returns the tunnel result and whether the session was just started
+// A live session with an open port skips the process list check
 func (a *app) prepare(alias string, c config.Conn, kind clients.Kind) (tunnels.Result, bool, error) {
 	var tunnel tunnels.Result
 	if kind.Networked {
@@ -84,18 +84,20 @@ func (a *app) open(args []string) error {
 	if err != nil {
 		return err
 	}
+	name := clean(alias)
 	if tunnel != "" && c.Tunnel != nil {
-		fmt.Fprintf(a.stdout, "%s 터널 %s %s:%d\n", alias, tunnelMessages[tunnel], c.Host, c.Port)
+		fmt.Fprintf(a.stdout, "%s tunnel %s %s\n", name, tunnelMessages[tunnel], clean(fmt.Sprintf("%s:%d", c.Host, c.Port)))
 	}
-	state := "이미 실행 중"
+	state := "already running"
 	if started {
-		state = "시작"
+		state = "started"
 	}
-	fmt.Fprintf(a.stdout, "%s 세션 %s\n", alias, state)
+	fmt.Fprintf(a.stdout, "%s session %s\n", name, state)
 	return nil
 }
 
-// 한 별칭이 실패해도 나머지는 계속 닫고 오류를 모아 반환
+// A failing alias doesn't stop the rest from closing
+// The errors come back joined
 func (a *app) close(args []string) error {
 	if len(args) != 1 {
 		return usageError("close")
@@ -116,16 +118,18 @@ func (a *app) close(args []string) error {
 		}
 		r, err := tunnels.Close(a.cfg, a.cfg.Conns[alias])
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s 터널 닫기 실패: %w", alias, err))
+			errs = append(errs, fmt.Errorf("%s couldn't close the tunnel: %w", alias, err))
 			continue
 		}
+		// close all prints aliases straight from conns.toml
+		name := clean(alias)
 		switch {
 		case r == tunnels.Closed || stopped:
-			fmt.Fprintf(a.stdout, "%s 닫힘\n", alias)
+			fmt.Fprintf(a.stdout, "%s closed\n", name)
 		case r == tunnels.Foreign:
-			fmt.Fprintf(a.stdout, "%s gatereach가 연 터널이 아니라 유지\n", alias)
+			fmt.Fprintf(a.stdout, "%s kept open since gatereach didn't open the tunnel\n", name)
 		case !all:
-			fmt.Fprintf(a.stdout, "%s 이미 닫힘\n", alias)
+			fmt.Fprintf(a.stdout, "%s already closed\n", name)
 		}
 	}
 	return errors.Join(errs...)
@@ -135,9 +139,9 @@ func (a *app) discover(args []string) error {
 	if len(args) != 1 {
 		return usageError("discover")
 	}
-	newKind, ok := tunnels.Kinds[args[0]]
-	if !ok {
-		return fmt.Errorf("지원하지 않는 터널: %s", args[0])
+	kind, err := tunnels.Of(a.cfg, args[0])
+	if err != nil {
+		return err
 	}
 	known := map[string]bool{}
 	for _, c := range a.cfg.Conns {
@@ -145,7 +149,7 @@ func (a *app) discover(args []string) error {
 			known[c.Tunnel.Target] = true
 		}
 	}
-	targets, err := newKind(a.cfg.Tool(args[0], args[0])).Discover()
+	targets, err := kind.Discover()
 	if err != nil {
 		return err
 	}
@@ -154,7 +158,8 @@ func (a *app) discover(args []string) error {
 		if known[t.Target] {
 			mark = "added"
 		}
-		fmt.Fprintf(a.stdout, "%-6s %-28s %-6s %-16s %s\n", mark, t.Name, or(t.Client, "-"), strings.Join(t.Users, ","), t.Target)
+		fmt.Fprintf(a.stdout, "%-6s %-28s %-6s %-16s %s\n",
+			mark, clean(t.Name), clean(or(t.Client, "-")), clean(strings.Join(t.Users, ",")), clean(t.Target))
 	}
 	return nil
 }

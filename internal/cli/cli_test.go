@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,7 +14,7 @@ import (
 	"github.com/jeon-jihyeon/gatereach/internal/version"
 )
 
-// GATEREACH_CONFIG를 바꾸므로 병렬 실행하지 않음
+// Tests that use it don't run in parallel since it sets GATEREACH_CONFIG
 func useConfig(t *testing.T, content string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "conns.toml")
@@ -44,13 +45,17 @@ func TestRun(t *testing.T) {
 		want    want
 	}{
 		{"version", "", []string{"--version"}, want{code: 0, out: version.Version + "\n"}},
+		{"version word", "", []string{"version"}, want{code: 0, out: version.Version + "\n"}},
 		{"usage hides serve", "", nil, want{code: 2, err: "gatereach q"}},
-		{"unknown command", "", []string{"nope"}, want{code: 2, err: "알 수 없는 명령"}},
-		{"broken config", "[conns.a\n", []string{"ls"}, want{code: 1, err: "설정 파일 읽기 실패"}},
-		{"unknown tunnel kind to discover", "", []string{"discover", "ssh"}, want{code: 1, err: "지원하지 않는 터널"}},
-		{"close an unknown alias", "", []string{"close", "nope"}, want{code: 1, err: "알 수 없는 별칭"}},
+		{"unknown command", "", []string{"nope"}, want{code: 2, err: "unknown command"}},
+		{"broken config", "[conns.a\n", []string{"ls"}, want{code: 1, err: "couldn't read the config file"}},
+		{"unknown tunnel kind to discover", "", []string{"discover", "ssh"}, want{code: 1, err: "unsupported tunnel"}},
+		{"close an unknown alias", "", []string{"close", "nope"}, want{code: 1, err: "unknown alias"}},
 		{"close all with nothing open", existing, []string{"close", "all"}, want{code: 0}},
+		{"close shows escapes in an alias", "[conns.\"e\\u001b\"]\nclient = \"redis\"\nport = 1\n",
+			[]string{"close", "e\x1b"}, want{code: 0, out: "e\\u001B already closed\n"}},
 		{"flag help", "", []string{"q", "-h"}, want{code: 2}},
+		{"bad flag value", "", []string{"q", "r", "GET k", "--limit", "abc"}, want{code: 2, err: "invalid value"}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -59,6 +64,9 @@ func TestRun(t *testing.T) {
 			assert.Equal(t, tc.want.code, code, errw)
 			assert.Contains(t, out, tc.want.out)
 			assert.Contains(t, errw, tc.want.err)
+			if tc.want.err != "" {
+				assert.Equal(t, 1, strings.Count(errw, tc.want.err), "printed once")
+			}
 			assert.NotContains(t, errw, "gatereach serve")
 		})
 	}

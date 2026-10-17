@@ -7,13 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 
@@ -21,40 +22,41 @@ import (
 	"github.com/jeon-jihyeon/gatereach/internal/record"
 )
 
-// 토픽 대신 메타데이터를 조회하는 쿼리
+// A query that lists topic metadata instead of reading a topic
 const kafkaTopics = "topics"
 
 type kafkaClient struct {
 	conn     config.Conn
 	password string
-	// 세션이 쥐는 클라이언트 하나
-	// 조회마다 파티션만 붙였다 떼어 연결과 인증을 재사용
-	cl  *kgo.Client
-	adm *kadm.Client
+	// The session holds one client
+	// Each read only adds and drops partitions so the connection and auth are reused
+	cl   *kgo.Client
+	adm  *kadm.Client
+	idle time.Duration
 }
 
 func newKafka(conn config.Conn, password string) Client {
-	return &kafkaClient{conn: conn, password: password}
+	return &kafkaClient{conn: conn, password: password, idle: kafkaIdle}
 }
 
-// 소비만 하므로 쓰기 경로 없음
+// It only consumes so there's no write path
 func kafkaCheck(_ string, write bool) error {
 	if write {
-		return errors.New("kafka는 읽기만 지원")
+		return errors.New("kafka only reads")
 	}
 	return nil
 }
 
-// SASL PLAIN은 계정과 비밀값이 함께 있어야 함
+// SASL PLAIN needs the user and the secret together
 func kafkaValidate(conn config.Conn) error {
 	if conn.Secret != "" && conn.User == "" {
-		return errors.New("kafka secret을 쓰려면 user 필요")
+		return errors.New("a kafka secret needs a user")
 	}
 	return nil
 }
 
-// 컨슈머 그룹 없이 파티션을 직접 읽어 오프셋 커밋이 남지 않음
-// 트랜잭션 토픽의 커밋 마커도 받아 끝 판정에만 씀
+// Partitions are read directly without a consumer group so no offset commit is left behind
+// Commit markers of transactional topics are kept only to detect the end
 func (k *kafkaClient) Connect(ctx context.Context) error {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(net.JoinHostPort(k.conn.Host, strconv.Itoa(k.conn.Port))),
@@ -63,6 +65,7 @@ func (k *kafkaClient) Connect(ctx context.Context) error {
 	if k.password != "" {
 		opts = append(opts, kgo.SASL(plain.Auth{User: k.conn.User, Pass: k.password}.AsMechanism()))
 	}
+	// SASL PLAIN sends the secret as is so it never goes without TLS
 	if k.password != "" || k.conn.TLS {
 		opts = append(opts, kgo.DialTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12}))
 	}
@@ -91,41 +94,50 @@ func (k *kafkaClient) Read(ctx context.Context, q Query, emit Emit) error {
 	}
 	topic := strings.TrimSpace(q.Text)
 	if topic == kafkaTopics {
-		return k.topics(ctx, q.Limit, emit)
+		return k.topics(ctx, q.Limit, q.use, emit)
 	}
-	return k.sample(ctx, topic, q.Limit, emit)
+	return k.sample(ctx, topic, q.Limit, q.use, emit)
 }
 
-// topics는 폴링에 맡기고 토픽은 컨슈머를 끝내지 않고 새 메시지를 받음
+// topics is left to polling
+// A topic keeps its consumer open and takes new messages
 func (k *kafkaClient) Follow(ctx context.Context, q Query, emit Emit) (bool, error) {
 	topic := strings.TrimSpace(q.Text)
 	if topic == kafkaTopics {
 		return false, nil
 	}
-	return true, k.tail(ctx, topic, q.Limit, emit)
+	return true, k.tail(ctx, topic, q.Limit, q.use, emit)
 }
 
-func (k *kafkaClient) topics(ctx context.Context, limit int, emit Emit) error {
+// Each record is paid for once it's out so it's emitted before use can stop the read
+func emitPaid(r record.Record, use func(float64) error, emit Emit) error {
+	if err := emit(r); err != nil {
+		return err
+	}
+	return use(1)
+}
+
+func (k *kafkaClient) topics(ctx context.Context, limit int, use func(float64) error, emit Emit) error {
 	td, err := k.adm.ListTopics(ctx)
 	if err != nil {
 		return err
 	}
-	names := td.Names()
-	sort.Strings(names)
-	for i, n := range names {
+	// kadm returns the names sorted
+	for i, n := range td.Names() {
 		if i >= limit {
 			break
 		}
 		r := record.New([]string{"topic", "partitions"}, []any{n, int64(len(td[n].Partitions))})
-		if err := emit(r); err != nil {
+		if err := emitPaid(r, use, emit); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// 파티션마다 끝에서 limit 건 앞부터 읽을 위치와 시작 시점의 끝
-// 끝이 시작보다 크지 않은 빈 파티션은 ends에서 빠짐
+// Per partition where to read from and the end when the read started
+// Reading starts limit records before the end
+// The ends leave out an empty partition whose end isn't past its start
 func (k *kafkaClient) window(ctx context.Context, topic string, limit int) (map[int32]kgo.Offset, map[int32]int64, error) {
 	var (
 		wg           sync.WaitGroup
@@ -136,11 +148,13 @@ func (k *kafkaClient) window(ctx context.Context, topic string, limit int) (map[
 	go func() { defer wg.Done(); starts, serr = k.adm.ListStartOffsets(ctx, topic) }()
 	go func() { defer wg.Done(); ends, eerr = k.adm.ListEndOffsets(ctx, topic) }()
 	wg.Wait()
-	if err := errors.Join(serr, eerr); err != nil {
-		return nil, nil, fmt.Errorf("kafka 토픽 %s 조회 실패: %w", topic, err)
+	err := errors.Join(serr, eerr, ends.Error())
+	// A missing topic comes back as a listed partition -1 with this error
+	if errors.Is(err, kerr.UnknownTopicOrPartition) {
+		return nil, nil, errors.New("no such kafka topic: " + topic)
 	}
-	if err := ends.Error(); err != nil {
-		return nil, nil, fmt.Errorf("kafka 토픽 %s 조회 실패: %w", topic, err)
+	if err != nil {
+		return nil, nil, fmt.Errorf("kafka topic %s lookup failed: %w", topic, err)
 	}
 	from := map[int32]kgo.Offset{}
 	until := map[int32]int64{}
@@ -155,20 +169,27 @@ func (k *kafkaClient) window(ctx context.Context, topic string, limit int) (map[
 		}
 	})
 	if len(from) == 0 {
-		return nil, nil, errors.New("kafka 토픽 없음: " + topic)
+		return nil, nil, errors.New("no such kafka topic: " + topic)
 	}
 	return from, until, nil
 }
 
-// 붙인 파티션을 끝에 떼고 버퍼에 남은 메시지도 버림
+// The returned func drops the partitions and any messages left in the buffer
 func (k *kafkaClient) attach(topic string, from map[int32]kgo.Offset) func() {
 	k.cl.AddConsumePartitions(map[string]map[int32]kgo.Offset{topic: from})
 	return func() { k.cl.PurgeTopicsFromConsuming(topic) }
 }
 
-// 시작 시점의 끝까지 읽거나 합계 limit 건에서 종료
-// 파티션이 여럿이면 토픽 전체의 최신 limit 건이 아닌 파티션별 표본
-func (k *kafkaClient) sample(ctx context.Context, topic string, limit int, emit Emit) error {
+// How long a sample waits for a fetch before it takes every open partition as ended
+// 1. A compacted topic can lose the records just before its end so no record arrives at the end itself
+// 2. The client hides fetches that bring nothing so a partition caught up in such a gap goes quiet
+// 3. A broker answers a fetch at once when it holds records past the position
+const kafkaIdle = 10 * time.Second
+
+// Stops at the end seen when the read started or after limit records in total
+// With several partitions it's a per partition sample and not the topic's latest limit records
+// A read cut by its context returns the context's error so Run can tell a timeout from a full sample
+func (k *kafkaClient) sample(ctx context.Context, topic string, limit int, use func(float64) error, emit Emit) error {
 	from, until, err := k.window(ctx, topic, limit)
 	if err != nil || len(until) == 0 {
 		return err
@@ -176,8 +197,14 @@ func (k *kafkaClient) sample(ctx context.Context, topic string, limit int, emit 
 	defer k.attach(topic, from)()
 	n := 0
 	for len(until) > 0 && n < limit {
-		fetches := k.cl.PollFetches(ctx)
-		if ctx.Err() != nil {
+		idle, cancel := context.WithTimeout(ctx, k.idle)
+		fetches := k.cl.PollFetches(idle)
+		cancel()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Nothing came within the idle wait so every open partition sits at its end
+		if errors.Is(fetches.Err0(), context.DeadlineExceeded) {
 			return nil
 		}
 		if err := fetchError(fetches); err != nil {
@@ -186,7 +213,12 @@ func (k *kafkaClient) sample(ctx context.Context, topic string, limit int, emit 
 		var stop error
 		fetches.EachRecord(func(m *kgo.Record) {
 			end, open := until[m.Partition]
-			if stop != nil || n >= limit || !open || m.Offset >= end {
+			if stop != nil || n >= limit || !open {
+				return
+			}
+			// A record past the end shows the position passed it over a gap
+			if m.Offset >= end {
+				delete(until, m.Partition)
 				return
 			}
 			if m.Offset+1 >= end {
@@ -195,7 +227,7 @@ func (k *kafkaClient) sample(ctx context.Context, topic string, limit int, emit 
 			if m.Attrs.IsControl() {
 				return
 			}
-			if stop = emit(kafkaRecord(m)); stop == nil {
+			if stop = emitPaid(kafkaRecord(m), use, emit); stop == nil {
 				n++
 			}
 		})
@@ -206,8 +238,9 @@ func (k *kafkaClient) sample(ctx context.Context, topic string, limit int, emit 
 	return nil
 }
 
-// 파티션마다 최근 limit 건을 먼저 내보내고 이후 새 메시지를 계속 받음
-func (k *kafkaClient) tail(ctx context.Context, topic string, limit int, emit Emit) error {
+// Emits the latest limit records per partition first and then keeps taking new messages
+// It has no runs so a timeout never applies
+func (k *kafkaClient) tail(ctx context.Context, topic string, limit int, use func(float64) error, emit Emit) error {
 	from, _, err := k.window(ctx, topic, limit)
 	if err != nil {
 		return err
@@ -224,7 +257,7 @@ func (k *kafkaClient) tail(ctx context.Context, topic string, limit int, emit Em
 		var stop error
 		fetches.EachRecord(func(m *kgo.Record) {
 			if stop == nil && !m.Attrs.IsControl() {
-				stop = emit(kafkaRecord(m))
+				stop = emitPaid(kafkaRecord(m), use, emit)
 			}
 		})
 		if stop != nil {
@@ -254,9 +287,9 @@ func kafkaRecord(m *kgo.Record) record.Record {
 	)
 }
 
-// UTF-8 텍스트는 문자열
-// 그 밖의 바이트는 MySQL 바이너리 열처럼 base64 문자열이라 대체 문자로 잃지 않음
-// 없으면 null
+// 1. UTF-8 text is a string
+// 2. Other bytes are a base64 string like MySQL binary columns so nothing is lost to replacement characters
+// 3. nil is null
 func kafkaBytes(b []byte) any {
 	if b == nil {
 		return nil

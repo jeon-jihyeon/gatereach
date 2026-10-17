@@ -16,7 +16,8 @@ linters:
         - (*database/sql.Rows).Close
         - (*github.com/redis/go-redis/v9.Client).Close
         - (github.com/jeon-jihyeon/gatereach/internal/clients.Client).Close
-        # Remove calls clean up on a best effort basis, and a file that's already gone is fine
+        # Remove calls clean up on a best effort basis
+        # A file that's already gone is fine
         - os.Remove
         - os.RemoveAll
         # A print to the terminal that fails has nowhere else to report
@@ -26,9 +27,9 @@ linters:
     staticcheck:
       checks:
         - all
-        # Korean messages may start with a product name such as Keychain or MySQL
+        # Messages may start with a product name such as MySQL
         - -ST1005
-        # Doc comments follow the Korean comment rules, not the English Name form these checks expect
+        # Doc comments explain why and constraints instead of the Name form these checks expect
         - -ST1020
         - -ST1021
         - -ST1022

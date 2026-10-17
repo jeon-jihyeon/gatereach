@@ -1,5 +1,6 @@
 # build output
-# bin/gatereach is the committed launcher, so only the root binary is ignored
+# bin/gatereach is the committed launcher
+# Only the binary at the root is ignored
 /dist/
 /gatereach
 *.test

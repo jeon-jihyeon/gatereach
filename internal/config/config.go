@@ -1,8 +1,7 @@
-// Package config는 연결 설정 파일과 고정 포트
+// Package config holds the connections file and the fixed ports
 package config
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -15,7 +14,7 @@ import (
 
 const DefaultHost = "127.0.0.1"
 
-// Linux 32768부터와 macOS 49152부터인 동적 포트 범위 아래 고정 포트
+// Fixed ports stay below the dynamic ranges that start at 32768 on Linux and 49152 on macOS
 const (
 	PortBase = 20000
 	PortSpan = 12000
@@ -26,11 +25,10 @@ type Tunnel struct {
 	Target string `toml:"target"`
 }
 
-// 별칭 하나의 연결
-// Port 0은 포트 없는 연결
 type Conn struct {
-	Client   string  `toml:"client"`
-	Host     string  `toml:"host"`
+	Client string `toml:"client"`
+	Host   string `toml:"host"`
+	// 0 means a connection without a port
 	Port     int     `toml:"port"`
 	User     string  `toml:"user"`
 	Database string  `toml:"database"`
@@ -39,20 +37,30 @@ type Conn struct {
 	Secret   string  `toml:"secret"`
 	TLS      bool    `toml:"tls"`
 	Tunnel   *Tunnel `toml:"tunnel"`
+	// Lets q take --write for this alias
+	// Only the user sets it by editing the file since add has no flag for it
+	Write bool `toml:"write"`
+
+	Workgroup string `toml:"workgroup"`
+	// A URL that starts with `s3://`
+	// Empty uses the workgroup's result location
+	OutputLocation string `toml:"output_location"`
+	// Empty means AwsDataCatalog
+	Catalog string `toml:"catalog"`
 }
 
-// 터널 도구 설정
+// Settings of a tunnel tool
 type Tool struct {
-	// 비어 있으면 PATH의 기본 이름
+	// Empty means the default name on PATH
 	Bin string `toml:"bin"`
-	// TELEPORT_HOME 같은 도구 홈 폴더
+	// The tool's home folder such as TELEPORT_HOME
 	Home string `toml:"home"`
 }
 
 type Config struct {
 	Conns   map[string]Conn `toml:"conns"`
 	Tunnels map[string]Tool `toml:"tunnels"`
-	// 파일에 적힌 별칭 순서
+	// Aliases in the order the file lists them
 	Aliases []string `toml:"-"`
 }
 
@@ -68,7 +76,7 @@ func Path() string {
 	return filepath.Join(base, "gatereach", "conns.toml")
 }
 
-// 파일이 없으면 빈 설정
+// A missing file gives an empty config
 func Load() (*Config, error) {
 	cfg := &Config{Conns: map[string]Conn{}, Tunnels: map[string]Tool{}}
 	p := Path()
@@ -77,7 +85,7 @@ func Load() (*Config, error) {
 		return cfg, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("설정 파일 읽기 실패: %s\n%w", p, err)
+		return nil, fmt.Errorf("couldn't read the config file: %s\n%w", p, err)
 	}
 	for _, k := range md.Keys() {
 		if len(k) == 2 && k[0] == "conns" {
@@ -93,8 +101,7 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// 종류별 도구 설정
-// `~`를 풀고 실행 파일이 비면 fallback
+// Expands `~` and uses fallback when the binary is empty
 func (c *Config) Tool(kind, fallback string) Tool {
 	t := c.Tunnels[kind]
 	t.Bin = expand(t.Bin)
@@ -105,7 +112,7 @@ func (c *Config) Tool(kind, fallback string) Tool {
 	return t
 }
 
-// 같은 host에서 다른 연결이 쓰는 포트
+// Ports the connections on host already use
 func (c *Config) UsedPorts(host string) map[int]bool {
 	used := map[int]bool{}
 	for _, o := range c.Conns {
@@ -132,6 +139,12 @@ func (c Conn) Has(key string) bool {
 		return c.Profile != ""
 	case "region":
 		return c.Region != ""
+	case "workgroup":
+		return c.Workgroup != ""
+	case "output_location":
+		return c.OutputLocation != ""
+	case "catalog":
+		return c.Catalog != ""
 	case "secret":
 		return c.Secret != ""
 	case "tunnel":
@@ -148,8 +161,8 @@ func expand(p string) string {
 	return p
 }
 
-// 같은 대상과 계정이면 언제나 같은 포트
-// 다른 연결이 이미 쓰는 포트면 범위 안에서 다음 빈 포트
+// The same target and user always get the same port
+// A port another connection uses moves on to the next free one in the range
 func StablePort(target, user string, used map[int]bool) (int, error) {
 	start := int(crc32.ChecksumIEEE([]byte(target+":"+user)) % PortSpan)
 	for i := range PortSpan {
@@ -158,11 +171,11 @@ func StablePort(target, user string, used map[int]bool) (int, error) {
 			return port, nil
 		}
 	}
-	return 0, errors.New("고정 포트 범위 소진")
+	return 0, fmt.Errorf("no fixed port left between %d and %d", PortBase, PortBase+PortSpan-1)
 }
 
-// 연결 하나의 TOML 표
-// 다시 읽어 같은 값이 나오지 않으면 거부해 설정 파일 손상 차단
+// The TOML table of one connection
+// It's refused unless reading it back gives the same values so the config file can't break
 func Render(alias string, c Conn) (string, error) {
 	var b strings.Builder
 	head := "conns." + quote(alias)
@@ -181,24 +194,31 @@ func Render(alias string, c Conn) (string, error) {
 	str("database", c.Database)
 	str("profile", c.Profile)
 	str("region", c.Region)
+	str("workgroup", c.Workgroup)
+	str("output_location", c.OutputLocation)
+	str("catalog", c.Catalog)
 	str("secret", c.Secret)
 	if c.TLS {
 		b.WriteString("tls = true\n")
+	}
+	if c.Write {
+		b.WriteString("write = true\n")
 	}
 	if c.Tunnel != nil {
 		fmt.Fprintf(&b, "\n[%s.tunnel]\n", head)
 		str("type", c.Tunnel.Type)
 		str("target", c.Tunnel.Target)
 	}
+	text := b.String()
 	var back Config
-	if _, err := toml.Decode(b.String(), &back); err != nil {
-		return "", fmt.Errorf("설정 값으로 쓸 수 없는 문자: %w", err)
+	if _, err := toml.Decode(text, &back); err != nil {
+		return "", fmt.Errorf("a character the config can't hold\n%w", err)
 	}
 	got, ok := back.Conns[alias]
 	if !ok || !sameConn(got, c) {
-		return "", errors.New("설정 값으로 쓸 수 없는 문자")
+		return "", errors.New("a character the config can't hold\ncheck the values for invalid UTF-8")
 	}
-	return b.String(), nil
+	return text, nil
 }
 
 func sameConn(a, b Conn) bool {
@@ -213,9 +233,9 @@ func sameConn(a, b Conn) bool {
 }
 
 // TOML basic string
-// 제어 문자는 DEL까지 모두 이스케이프
+// Control characters and DEL are escaped since TOML refuses them raw
 func quote(s string) string {
-	var b bytes.Buffer
+	var b strings.Builder
 	b.WriteByte('"')
 	for _, r := range s {
 		switch {
@@ -230,7 +250,7 @@ func quote(s string) string {
 		case r == '\r':
 			b.WriteString(`\r`)
 		case r < 0x20 || r == 0x7f:
-			b.WriteString(`\u` + fmt.Sprintf("%04X", r))
+			fmt.Fprintf(&b, `\u%04X`, r)
 		default:
 			b.WriteRune(r)
 		}
@@ -239,7 +259,7 @@ func quote(s string) string {
 	return b.String()
 }
 
-// 기존 내용과 주석 보존을 위해 파일 끝에 추가만 함
+// Only appends to the end so existing content and comments survive
 func Append(alias string, c Conn) (string, error) {
 	text, err := Render(alias, c)
 	if err != nil {
@@ -253,37 +273,42 @@ func Append(alias string, c Conn) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	if _, err := f.WriteString(text); err != nil {
+	_, werr := f.WriteString(text)
+	// A failed close can mean the appended text never reached the disk
+	if err := errors.Join(werr, f.Close()); err != nil {
 		return "", err
 	}
 	return p, nil
 }
 
-// 로그와 소켓 폴더의 기준인 설정 폴더
+// The config folder that logs and sockets sit under
 func Dir() string {
 	return filepath.Dir(Path())
 }
 
-// 별칭마다 자식 프로세스 stderr를 받는 로그 파일과 그 옆의 잠금 파일
+// The lock file beside conns.toml that add holds from its checks to its append
+func LockPath() string {
+	return Path() + ".lock"
+}
+
+// Per alias log file for a child process's stderr and the lock file beside it
 func LogPath(alias, suffix string) string {
 	return filepath.Join(Dir(), "logs", FileKey(alias)+suffix)
 }
 
-// 파일 이름이 겹치는 별칭도 서로 다른 파일을 쓰도록 별칭 해시를 붙인 이름
+// The alias hash keeps aliases whose file names collide in separate files
 func FileKey(alias string) string {
 	return FileName(alias) + "-" + AliasHash(alias)
 }
 
-// 별칭의 crc32 16진수 8자리
+// 8 hex digits of the alias's crc32
 func AliasHash(alias string) string {
 	return fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(alias)))
 }
 
-// 별칭을 파일 이름으로 변환
-// 1. 유지: ASCII 영숫자와 비ASCII 문자 그리고 `.` `-` `_`
-// 2. 그 밖의 문자가 이어지면 `_` 하나로 치환
-// 서로 다른 별칭이 같은 이름이 될 수 있어 유일성이 필요한 곳은 해시를 덧붙임
+// 1. Keeps ASCII letters and digits, non-ASCII characters and `.` `-` `_`
+// 2. Replaces each run of other characters with one `_`
+// Different aliases can map to the same name so callers that need uniqueness append the hash
 func FileName(alias string) string {
 	var b strings.Builder
 	prev := false

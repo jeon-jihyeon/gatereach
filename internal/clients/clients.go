@@ -1,14 +1,16 @@
-// Package clients는 소스별 드라이버를 Record 스트림 하나로 맞춤
+// Package clients turns each source driver into one Record stream
 package clients
 
-//go:generate go run go.uber.org/mock/mockgen@v0.6.0 -destination=mocks/client.go -package=mocks github.com/jeon-jihyeon/gatereach/internal/clients Client
+//go:generate go run go.uber.org/mock/mockgen@v0.6.0 -destination=mocks/client.go -package=mocks github.com/jeon-jihyeon/gatereach/internal/clients Client,Follower
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"hash"
-	"sort"
+	"maps"
+	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,73 +20,124 @@ import (
 	"github.com/jeon-jihyeon/gatereach/internal/record"
 )
 
-// 레코드 하나를 받는 쪽
-// 오류를 돌려주면 스트림 중단
+// Returning an error stops the stream
 type Emit func(record.Record) error
 
 type Query struct {
 	Text  string
 	Write bool
 	Limit int
+	// Run ends one run past it
+	// 0 means no limit
+	Timeout time.Duration
+	// Takes what the source read for the work just done in the unit of its Budget
+	// 1. A client calls it after the work and emits that work's results before returning its error
+	// 2. nil means nothing is measured
+	Use func(amount float64) error
 }
 
-// 연결이 끊겨 아무것도 실행하지 않았다는 뜻
-// 세션이 다시 연결한 뒤 한 번 재시도
-var ErrDisconnected = errors.New("연결 끊김")
+// Passes the amount on when --max is set
+func (q Query) use(amount float64) error {
+	if q.Use == nil {
+		return nil
+	}
+	return q.Use(amount)
+}
 
-// 소스 하나의 연결
-// 세션이 Connect로 연 연결을 닫을 때까지 쥐고 요청마다 재사용
+// The connection dropped and nothing ran
+// The session reconnects and retries once
+var ErrDisconnected = errors.New("disconnected")
+
+// What the source read reached --max
+// The records the paid work returned are emitted before it
+var ErrBudget = errors.New("budget reached")
+
+// The session holds the connection Connect opened until Close and reuses it for every request
 type Client interface {
-	// 실패하면 연 자원을 스스로 정리
+	// Cleans up whatever it opened when it fails
 	Connect(ctx context.Context) error
-	// 쿼리 한 번의 결과
-	// 최대 Limit 건
-	// 끊긴 연결로 아무것도 실행하지 못했으면 ErrDisconnected
+	// Emits at most Limit records
+	// Returns ErrDisconnected when a dropped connection ran nothing
 	Read(ctx context.Context, q Query, emit Emit) error
 	Close() error
 }
 
-// 폴링 대신 소스가 직접 새 레코드를 밀어주는 클라이언트
+// A client whose source pushes new records instead of being polled
 type Follower interface {
-	// 처리하지 않는 쿼리면 ok false
+	// ok is false for a query it doesn't handle
 	Follow(ctx context.Context, q Query, emit Emit) (ok bool, err error)
 }
 
 type Kind struct {
-	// host와 port로 붙어 터널이 먼저 열려야 하는 소스
+	// Connects through host and port so the tunnel has to open first
 	Networked bool
 	Required  []string
-	// 쓰기 차단 규칙
-	// 연결 상태와 무관해 연결 없이 실행 전에 검사
+	// Write rules don't depend on the connection
+	// so they run before anything connects
 	Check func(text string, write bool) error
-	// 필수 키 밖의 설정 조합 검사
-	// 없으면 검사하지 않음
+	// Checks setting combinations beyond the required keys
+	// nil skips the check
 	Validate func(conn config.Conn) error
-	// password는 세션이 한 번 해석한 비밀값
-	New func(conn config.Conn, password string) Client
+	// password is the secret the session resolved once
+	New    func(conn config.Conn, password string) Client
+	Budget Budget
+	// The per-run limit the CLI applies when --timeout isn't given
+	// 0 leaves a run unlimited
+	Timeout time.Duration
 }
 
+// The unit --max counts in
+type Budget struct {
+	// Named in the message for a bad --max
+	Unit string
+	// A valid --max shown next to the unit
+	Example string
+	// Turns --max into an amount before any connection
+	Parse func(text string) (float64, error)
+	// Shows an amount in the report
+	Format func(amount float64) string
+}
+
+// Default timeouts
+// 1. MySQL and Redis are shared servers so a forgotten query must not hold them for long
+// 2. DynamoDB pages through a table on its own capacity so it gets longer
+// 3. Athena runs long by design and --max bounds its cost
+// 4. Kafka follows a topic without end
 var Kinds = map[string]Kind{
-	"mysql":    {Networked: true, Required: []string{"port", "user"}, Check: mysqlCheck, New: newMySQL},
-	"redis":    {Networked: true, Required: []string{"port"}, Check: redisCheck, New: newRedis},
-	"dynamodb": {Networked: false, Check: dynamoCheck, New: newDynamoDB},
-	"kafka":    {Networked: true, Required: []string{"port"}, Check: kafkaCheck, Validate: kafkaValidate, New: newKafka},
+	"mysql": {
+		Networked: true, Required: []string{"port", "user"}, Check: mysqlCheck, New: newMySQL, Timeout: 30 * time.Second,
+		Budget: Budget{Unit: "rows examined", Example: "100000", Parse: parseWhole,
+			Format: formatCount("row examined", "rows examined")},
+	},
+	"redis": {
+		Networked: true, Required: []string{"port"}, Check: redisCheck, New: newRedis, Timeout: 10 * time.Second,
+		Budget: Budget{Unit: "reply elements", Example: "1000", Parse: parseWhole,
+			Format: formatCount("reply element", "reply elements")},
+	},
+	"dynamodb": {
+		Networked: false, Check: dynamoCheck, New: newDynamoDB, Timeout: 60 * time.Second,
+		Budget: Budget{Unit: "read capacity units", Example: "2.5", Parse: parseDecimal,
+			Format: formatCount("read capacity unit", "read capacity units")},
+	},
+	"kafka": {
+		Networked: true, Required: []string{"port"}, Check: kafkaCheck, Validate: kafkaValidate, New: newKafka,
+		Budget: Budget{Unit: "records", Example: "1000", Parse: parseWhole, Format: formatCount("record", "records")},
+	},
+	"athena": {
+		Networked: false, Required: []string{"workgroup"}, Check: athenaCheck, Validate: athenaValidate, New: newAthena,
+		Budget: Budget{Unit: "bytes scanned", Example: "10GB", Parse: parseBytes, Format: formatBytes},
+	},
 }
 
 func Names() []string {
-	out := make([]string, 0, len(Kinds))
-	for k := range Kinds {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(Kinds))
 }
 
-// 종류 확인과 필수 키 검사
+// Looks up the kind and checks the required keys
 func Get(conn config.Conn) (Kind, error) {
 	k, ok := Kinds[conn.Client]
 	if !ok {
-		return Kind{}, fmt.Errorf("지원하지 않는 client: %s\n가능: %s", conn.Client, strings.Join(Names(), " "))
+		return Kind{}, fmt.Errorf("unsupported client: %s\navailable: %s", conn.Client, strings.Join(Names(), " "))
 	}
 	var missing []string
 	for _, key := range k.Required {
@@ -93,7 +146,7 @@ func Get(conn config.Conn) (Kind, error) {
 		}
 	}
 	if len(missing) > 0 {
-		return Kind{}, fmt.Errorf("%s 연결 설정에 없는 키: %s", conn.Client, strings.Join(missing, ", "))
+		return Kind{}, fmt.Errorf("%s connection is missing: %s", conn.Client, strings.Join(missing, ", "))
 	}
 	if k.Validate != nil {
 		if err := k.Validate(conn); err != nil {
@@ -103,19 +156,19 @@ func Get(conn config.Conn) (Kind, error) {
 	return k, nil
 }
 
-// 폴링 주기와 중복 판별 필드
 type Watching struct {
 	Interval time.Duration
-	// 빈 값이면 레코드 전체
+	// The field that tells polled records apart
+	// Empty means the whole record
 	Key string
 }
 
-// 폴링 중복 판별에 기억할 최대 레코드 수
+// Records remembered to tell polled records apart
 const seenMax = 100_000
 
-// 새 레코드를 계속 내보냄
-// Follower가 받는 쿼리면 소스의 방식
-// 그 밖에는 폴링
+// Keeps emitting new records
+// A query the Follower handles uses the source's own way
+// Anything else is polled
 func Watch(ctx context.Context, c Client, q Query, w Watching, emit Emit) error {
 	if f, ok := c.(Follower); ok {
 		handled, err := f.Follow(ctx, q, emit)
@@ -123,16 +176,53 @@ func Watch(ctx context.Context, c Client, q Query, w Watching, emit Emit) error 
 			return err
 		}
 	}
-	return poll(ctx, c, q, w, seenMax, emit)
+	return poll(ctx, c, q, w, emit)
 }
 
-// 같은 쿼리를 주기마다 다시 실행하고 처음 보는 레코드만 내보냄
-// 레코드 대신 16바이트 해시만 기억하고 limit을 넘으면 오래된 것부터 잊음
-func poll(ctx context.Context, c Client, q Query, w Watching, limit int, emit Emit) error {
-	s := newSeen(limit)
+// One Read under q.Timeout
+func Run(ctx context.Context, c Client, q Query, emit Emit) error {
+	if q.Timeout <= 0 {
+		return c.Read(ctx, q, emit)
+	}
+	run, cancel := context.WithTimeout(ctx, q.Timeout)
+	defer cancel()
+	err := c.Read(run, q, emit)
+	if runPastDeadline(ctx, run, err) {
+		return timeoutError(q.Timeout)
+	}
+	return err
+}
+
+// Only a deadline of this run becomes the timeout message
+// 1. An ended request keeps its own error
+// 2. Any other error keeps its own message even past the deadline such as a sink that failed
+// 3. A driver that cuts a read by the socket deadline returns the os deadline error instead of the context's
+func runPastDeadline(ctx, run context.Context, err error) bool {
+	deadline := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
+	return deadline && !pastDeadline(ctx) && pastDeadline(run)
+}
+
+// A socket deadline set from the context's deadline can fire just before the context's timer marks it done
+// so the clock decides too
+func pastDeadline(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	d, ok := ctx.Deadline()
+	return ok && !time.Now().Before(d)
+}
+
+func timeoutError(d time.Duration) error {
+	return fmt.Errorf("query ran past --timeout %s", d)
+}
+
+// Reruns the query every interval and emits only records not seen before
+// It remembers a 16 byte hash per record and forgets the oldest past seenMax
+func poll(ctx context.Context, c Client, q Query, w Watching, emit Emit) error {
+	s := newSeen(seenMax)
 	for {
-		err := c.Read(ctx, q, func(r record.Record) error {
-			if s.has(r.Identity(w.Key)) {
+		err := Run(ctx, c, q, func(r record.Record) error {
+			if !s.add(r.Identity(w.Key)) {
 				return nil
 			}
 			return emit(r)
@@ -148,8 +238,8 @@ func poll(ctx context.Context, c Client, q Query, w Watching, limit int, emit Em
 	}
 }
 
-// 본 레코드의 해시 집합
-// 들어온 순서를 기억해 한도를 넘으면 가장 오래된 것부터 제거
+// Hashes of seen records
+// Keeps arrival order to drop the oldest first once past the limit
 type seen struct {
 	limit int
 	set   map[[16]byte]struct{}
@@ -158,18 +248,19 @@ type seen struct {
 }
 
 func newSeen(limit int) *seen {
+	// Only a size or a key past 64 bytes fails
 	h, _ := blake2b.New(16, nil)
 	return &seen{limit: limit, set: map[[16]byte]struct{}{}, h: h}
 }
 
-// 처음 보면 기억하고 false
-func (s *seen) has(identity []byte) bool {
+// Remembers the identity and reports whether it's new
+func (s *seen) add(identity []byte) bool {
 	s.h.Reset()
 	s.h.Write(identity)
 	var id [16]byte
 	copy(id[:], s.h.Sum(nil))
 	if _, ok := s.set[id]; ok {
-		return true
+		return false
 	}
 	s.set[id] = struct{}{}
 	s.order = append(s.order, id)
@@ -177,5 +268,5 @@ func (s *seen) has(identity []byte) bool {
 		delete(s.set, s.order[0])
 		s.order = s.order[1:]
 	}
-	return false
+	return true
 }

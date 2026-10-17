@@ -3,13 +3,18 @@ package cli
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jeon-jihyeon/gatereach/internal/clients"
+	"github.com/jeon-jihyeon/gatereach/internal/config"
 	"github.com/jeon-jihyeon/gatereach/internal/record"
 	"github.com/jeon-jihyeon/gatereach/internal/session"
 	"github.com/jeon-jihyeon/gatereach/internal/sinks"
@@ -18,9 +23,17 @@ import (
 )
 
 const (
-	DefaultLimit    = 1000
-	DefaultInterval = 5 * time.Second
+	defaultLimit    = 1000
+	defaultInterval = 5 * time.Second
+	// A shorter poll would turn --follow into a load on the source
+	minInterval = time.Second
+	// A query file past this is more likely data than a query
+	maxFile = 1 << 20
 )
+
+// Seconds past this wrap around when turned into a Duration
+// Whole seconds so the bound matches the error message
+var maxSeconds = math.Floor(time.Duration(math.MaxInt64).Seconds())
 
 type queryOptions struct {
 	alias    string
@@ -32,48 +45,108 @@ type queryOptions struct {
 	follow   bool
 	interval time.Duration
 	key      string
+	// Parsed only once the alias gives the source's unit
+	max     string
+	timeout time.Duration
+	// Without --timeout the client kind's default applies
+	timeoutSet bool
 }
 
-// 쿼리는 위치 인자나 --file 중 하나
-// 파일은 명시할 때만 읽어 쿼리와 같은 이름의 파일이 끼어들지 않음
+// The query is either the positional argument or --file
+// A file is read only when named so a file named like the query never slips in
 func (a *app) parseQuery(args []string) (queryOptions, error) {
 	fs := newFlags("q", a.stderr)
 	var o queryOptions
-	file := fs.String("file", "", "쿼리를 담은 파일")
-	fs.BoolVar(&o.write, "write", false, "읽기 전용 해제")
-	fs.IntVar(&o.limit, "limit", DefaultLimit, "한 번 조회의 최대 레코드 수")
-	fs.StringVar(&o.out, "out", "", "결과를 Data Package 폴더로 저장")
-	fs.StringVar(&o.format, "format", "arrow", formatHelp())
-	fs.BoolVar(&o.follow, "follow", false, "종료할 때까지 새 레코드를 계속 출력")
-	seconds := fs.Float64("interval", DefaultInterval.Seconds(), "폴링 주기 초")
-	fs.StringVar(&o.key, "key", "", "폴링 중복 판별 필드\n없으면 레코드 전체")
+	file := fs.String("file", "", "file holding the query")
+	fs.BoolVar(&o.write, "write", false, "allow writes")
+	fs.IntVar(&o.limit, "limit", defaultLimit, "most records each run returns\neach polling run included")
+	fs.StringVar(&o.out, "out", "", "save results as a Data Package folder")
+	fs.StringVar(&o.format, "format", "arrow", "data file format for --out: "+strings.Join(sinks.FormatNames(), " or "))
+	fs.BoolVar(&o.follow, "follow", false, "keep printing new records until stopped")
+	interval := fs.Float64("interval", defaultInterval.Seconds(), "seconds between polls with --follow")
+	fs.StringVar(&o.key, "key", "", "field that tells polled records apart\nthe whole record when left out")
+	fs.StringVar(&o.max, "max", "",
+		"most the source may read over the command in its own unit\nsuch as bytes scanned for athena or rows examined for mysql")
+	timeout := fs.Float64("timeout", 0, "seconds each run may take\n0 for no limit\nthe client's default when left out")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return o, err
 	}
 	switch {
 	case *file != "" && len(pos) == 1:
-		b, err := os.ReadFile(*file)
+		text, err := readQueryFile(*file)
 		if err != nil {
 			return o, err
 		}
-		o.alias, o.text = pos[0], string(b)
+		o.alias, o.text = pos[0], text
 	case *file == "" && len(pos) == 2:
 		o.alias, o.text = pos[0], pos[1]
 	default:
 		return o, usageError("q")
 	}
 	if o.limit < 1 {
-		return o, errors.New("--limit은 1 이상")
+		return o, errors.New("--limit must be at least 1")
 	}
 	if _, ok := sinks.Formats[o.format]; !ok {
-		return o, fmt.Errorf("지원하지 않는 형식: %s", o.format)
+		return o, fmt.Errorf("unsupported format: %s\navailable: %s", o.format, strings.Join(sinks.FormatNames(), " "))
 	}
-	if *seconds <= 0 {
-		return o, errors.New("--interval은 0보다 커야 함")
+	// The negated forms also refuse NaN
+	if !(*interval >= minInterval.Seconds()) {
+		return o, errors.New("--interval must be at least 1 second")
 	}
-	o.interval = time.Duration(*seconds * float64(time.Second))
+	if !(*timeout >= 0) {
+		return o, errors.New("--timeout must be 0 or above")
+	}
+	if o.interval, err = duration("interval", *interval); err != nil {
+		return o, err
+	}
+	if o.timeout, err = duration("timeout", *timeout); err != nil {
+		return o, err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "timeout" {
+			o.timeoutSet = true
+		}
+	})
 	return o, nil
+}
+
+// 1. Only a regular file so a FIFO or a device never blocks or streams forever
+// 2. Opened without blocking and checked on the open file so a path swapped after the check can't block either
+// 3. At most 1 MiB so a large file the agent points at never goes out whole as a query
+func readQueryFile(path string) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", fmt.Errorf("couldn't read --file: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("couldn't read --file: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", errors.New("--file must be a regular file")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxFile+1))
+	if err != nil {
+		return "", fmt.Errorf("couldn't read --file: %w", err)
+	}
+	if len(b) > maxFile {
+		return "", errors.New("--file is larger than 1 MiB")
+	}
+	return string(b), nil
+}
+
+func duration(name string, seconds float64) (time.Duration, error) {
+	if seconds >= maxSeconds {
+		return 0, fmt.Errorf("--%s must be under %d seconds", name, int64(maxSeconds))
+	}
+	d := time.Duration(seconds * float64(time.Second))
+	// A positive value that truncates to zero would turn the limit off
+	if seconds > 0 && d == 0 {
+		return 0, fmt.Errorf("--%s must be at least one nanosecond", name)
+	}
+	return d, nil
 }
 
 func (a *app) query(args []string) error {
@@ -82,35 +155,47 @@ func (a *app) query(args []string) error {
 		return err
 	}
 	interrupted, err := a.runQuery(o)
-	return exitFor(o, interrupted, err)
+	return exitFor(o.follow, interrupted, err)
 }
 
-// follow를 Ctrl-C나 SIGTERM으로 멈추면 정상 종료
-// 단건 조회를 멈추면 중단으로 기록하고 130
-// 출력 닫기 실패는 중단보다 먼저 알려 1로 끝냄
-func exitFor(o queryOptions, interrupted bool, err error) error {
+// 1. A follow stopped by a signal exits cleanly
+// 2. A stopped single read is recorded as interrupted and exits 130
+// 3. A failure to close the output wins over the interrupt and exits 1
+func exitFor(follow, interrupted bool, err error) error {
 	switch {
 	case err != nil:
 		return err
-	case interrupted && !o.follow:
-		return exitCode{code: exitInterrupted, msg: "중단됨"}
+	case interrupted && !follow:
+		return exitCode{code: exitInterrupted, msg: "interrupted"}
 	}
 	return nil
 }
 
-// 소스는 세션이 맡고 출력은 Sink가 맡음
-// 둘을 잇는 차례는 여기에만 둠
-// 터널과 세션보다 쓰기 차단 규칙을 먼저 확인
+// The session owns the source and the Sink owns the output
+// Only this function joins the two
+// The write rules are checked before any tunnel or session opens
 func (a *app) runQuery(o queryOptions) (bool, error) {
 	c, err := a.conn(o.alias)
 	if err != nil {
 		return false, err
 	}
+	// Only the user turns writes on for an alias
+	// so an agent told to write by what it read can't do so through a read-only alias
+	if o.write && !c.Write {
+		return false, fmt.Errorf("%s doesn't allow --write\nset write = true for it in %s by hand", o.alias, config.Path())
+	}
 	kind, err := clients.Get(c)
 	if err != nil {
 		return false, err
 	}
+	if !o.timeoutSet {
+		o.timeout = kind.Timeout
+	}
 	if err := kind.Check(o.text, o.write); err != nil {
+		return false, err
+	}
+	maxAmount, err := parseMax(c.Client, kind.Budget, o.max)
+	if err != nil {
 		return false, err
 	}
 	if err := sinks.CheckFolder(o.out); err != nil {
@@ -120,12 +205,18 @@ func (a *app) runQuery(o queryOptions) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// conns.toml can carry terminal escapes in an alias
+	name := clean(o.alias)
 	if tunnel == tunnels.Opened || tunnel == tunnels.Foreign {
-		fmt.Fprintf(a.stderr, "%s %s\n", o.alias, tunnelMessages[tunnel])
+		fmt.Fprintf(a.stderr, "%s %s\n", name, tunnelMessages[tunnel])
 	}
 	if started {
-		fmt.Fprintf(a.stderr, "%s 세션 시작\n", o.alias)
+		fmt.Fprintf(a.stderr, "%s session started\n", name)
 	}
+	// SIGTERM and a hangup wrap up the same way as Ctrl-C
+	// Caught before the sink opens so a signal never leaves its output unclosed
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
 	meta := sinks.Meta{
 		Version: version.Version, Alias: o.alias, Client: c.Client, User: c.User,
 		Query: o.text, Limit: o.limit, Write: o.write, Follow: o.follow, Started: time.Now(),
@@ -134,52 +225,85 @@ func (a *app) runQuery(o queryOptions) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// SIGTERM도 Ctrl-C처럼 마무리
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	req := session.Request{
 		Version: version.Version, Alias: o.alias, Query: o.text, Write: o.write,
-		Limit: o.limit, Follow: o.follow, Interval: o.interval, Key: o.key,
+		Limit: o.limit, Follow: o.follow, Interval: o.interval, Key: o.key, Max: maxAmount, Timeout: o.timeout,
 	}
-	end, runErr := session.Query(ctx, req, writer(sink))
-	// 이전 버전 세션은 아무것도 보내지 않고 거부하므로 다시 띄운 세션에 한 번 더 보냄
-	if errors.Is(runErr, session.ErrOutdated) {
-		if runErr = a.restart(o.alias); runErr == nil {
-			end, runErr = session.Query(ctx, req, writer(sink))
-		}
-	}
-	interrupted := ctx.Err() != nil
+	end, runErr := a.send(ctx, req, writer(sink))
+	// Interrupted only when the cancel ended the run
+	// 1. A signal after a finished run leaves its result as is
+	// 2. An error the session sent stays a run error
+	// 3. Closing the socket can cut a line so any other error after the cancel counts
+	interrupted := runErr != nil && end.Error == "" && ctx.Err() != nil
 	switch {
 	case interrupted && o.follow:
 		runErr = nil
 	case interrupted:
-		runErr = errors.New("중단됨")
+		runErr = errors.New("interrupted")
 	}
 	if end.Reconnected {
-		fmt.Fprintf(a.stderr, "%s 연결이 끊겨 다시 맺음\n세션 변수와 임시 테이블 초기화\n", o.alias)
+		fmt.Fprintf(a.stderr, "%s reconnected after a drop\nsession variables and temporary tables were reset\n", name)
 	}
-	if err := sink.Close(runErr); err != nil {
-		return interrupted, err
+	closeErr := sink.Close(runErr)
+	// Only an End the session sent carries a total
+	// 1. An interrupt or a broken connection leaves none
+	// 2. Every failure the session sent has its error text
+	if maxAmount > 0 && !interrupted && (runErr == nil || end.Error != "") {
+		fmt.Fprintln(a.stderr, budgetReport(name, kind.Budget, maxAmount, end))
 	}
 	if interrupted {
-		return true, nil
+		return true, closeErr
 	}
-	return false, runErr
+	return false, joinErrors(runErr, closeErr)
 }
 
-// 다른 버전의 세션을 멈추고 이 바이너리로 다시 띄움
-func (a *app) restart(alias string) error {
-	if _, err := session.Stop(alias); err != nil {
-		return err
+// A failed sink write comes back from both the run and the close
+// so the same error is reported once
+func joinErrors(runErr, closeErr error) error {
+	if closeErr != nil && errors.Is(runErr, closeErr) {
+		return runErr
 	}
-	if _, err := session.Ensure(alias); err != nil {
-		return err
-	}
-	fmt.Fprintf(a.stderr, "%s 세션을 새 버전으로 다시 시작\n", alias)
-	return nil
+	return errors.Join(runErr, closeErr)
 }
 
-// stdout JSON lines는 세션이 보낸 줄을 그대로 쓰고 폴더 출력만 레코드로 해석
+// No --max is 0
+func parseMax(client string, b clients.Budget, text string) (float64, error) {
+	if text == "" {
+		return 0, nil
+	}
+	amount, err := b.Parse(text)
+	if err != nil {
+		return 0, fmt.Errorf("%s --max takes %s, such as %s", client, b.Unit, b.Example)
+	}
+	return amount, nil
+}
+
+func budgetReport(alias string, b clients.Budget, maxAmount float64, end session.End) string {
+	if end.Spent {
+		return fmt.Sprintf("%s stopped at --max: read %s of %s", alias, b.Format(end.Used), b.Format(maxAmount))
+	}
+	return fmt.Sprintf("%s read %s of --max %s", alias, b.Format(end.Used), b.Format(maxAmount))
+}
+
+// A session of another version refuses before sending anything
+// so it's replaced by one this binary starts and the request goes once more
+func (a *app) send(ctx context.Context, req session.Request, emit func(line []byte) error) (session.End, error) {
+	end, err := session.Query(ctx, req, emit)
+	if !errors.Is(err, session.ErrOutdated) {
+		return end, err
+	}
+	if _, err := session.Stop(req.Alias); err != nil {
+		return session.End{}, err
+	}
+	if _, err := session.Ensure(req.Alias); err != nil {
+		return session.End{}, err
+	}
+	fmt.Fprintf(a.stderr, "%s session restarted on the new version\n", clean(req.Alias))
+	return session.Query(ctx, req, emit)
+}
+
+// stdout JSON lines copy the session's lines as is
+// Only folder output parses them into records
 func writer(sink sinks.Sink) func(line []byte) error {
 	if raw, ok := sink.(sinks.RawWriter); ok {
 		return raw.WriteRaw

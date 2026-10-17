@@ -1,4 +1,4 @@
-// Package proc는 gatereach가 끝나도 남는 자식 프로세스를 띄우고 준비될 때까지 대기
+// Package proc starts the child processes tunnels and sessions need with their locks and port owner checks
 package proc
 
 import (
@@ -12,41 +12,48 @@ import (
 	"time"
 )
 
-// 시간 초과로 SIGTERM을 보낸 뒤 SIGKILL까지 기다리는 시간
+// How long a timed-out child's group gets between SIGTERM and SIGKILL
 const killWait = 5 * time.Second
 
-// 준비되기 전에 자식이 끝남
+// Log lines LogTail shows
+const tailLines = 5
+
+// The child exited before it was ready
 type ExitError struct {
 	Code int
 }
 
-func (e *ExitError) Error() string { return fmt.Sprintf("종료 코드 %d", e.Code) }
+func (e *ExitError) Error() string { return fmt.Sprintf("exit code %d", e.Code) }
 
-// 대기 시간 안에 준비되지 않아 자식을 종료함
-var ErrTimeout = errors.New("시간 초과")
+// The child wasn't ready in time and was stopped
+var ErrTimeout = errors.New("timed out")
 
-// 새 프로세스 세션으로 띄워 부모와 셸의 Ctrl-C가 닿지 않음
-// stdout과 stderr는 매번 비운 로그 파일로 받아 크기를 한 번의 수명으로 제한
-// ready가 참이면 자식을 기다리지 않고 반환
-// 시간이 지나면 자식의 프로세스 그룹에 SIGTERM
-// 그래도 남으면 SIGKILL해 자식이 기다리는 손자 프로세스까지 정리
+// 1. The child runs in a new session so Ctrl-C in the parent or its shell never reaches it
+// 2. stdout and stderr go to a log file emptied on every start so it never grows past one run
+// 3. Returns without waiting on the child once ready is true while the child still runs
+// 4. On timeout the child's process group gets SIGTERM
+// 5. A group still alive after the grace period gets SIGKILL so grandchildren end even when the child already exited
 func Spawn(argv, env []string, logPath string, ready func() bool, wait, tick time.Duration) error {
 	return spawn(argv, env, logPath, ready, wait, tick, killWait)
 }
 
 func spawn(argv, env []string, logPath string, ready func() bool, wait, tick, grace time.Duration) error {
+	if len(argv) == 0 {
+		return errors.New("no command to run")
+	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		return err
 	}
-	log, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	out, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	defer log.Close()
+	// The child holds its own copy of the file
+	defer out.Close()
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
-	cmd.Stdout = log
-	cmd.Stderr = log
+	cmd.Stdout = out
+	cmd.Stderr = out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return err
@@ -59,7 +66,14 @@ func spawn(argv, env []string, logPath string, ready func() bool, wait, tick, gr
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if ready() {
-			return nil
+			// A child that already exited didn't make the ready state
+			// so a port another process opened meanwhile never counts as its own
+			select {
+			case <-exited:
+				return &ExitError{Code: cmd.ProcessState.ExitCode()}
+			default:
+				return nil
+			}
 		}
 		select {
 		case <-exited:
@@ -67,20 +81,30 @@ func spawn(argv, env []string, logPath string, ready func() bool, wait, tick, gr
 		case <-time.After(tick):
 		}
 	}
-	// Setsid로 자식이 그룹 대표라 음수 pid가 그룹 전체
+	// Setsid makes the child the group leader so the negative pid is the whole group
 	group := -cmd.Process.Pid
 	_ = syscall.Kill(group, syscall.SIGTERM)
-	select {
-	case <-exited:
-	case <-time.After(grace):
-		_ = syscall.Kill(group, syscall.SIGKILL)
-		<-exited
+	// The child may exit while a grandchild that ignores SIGTERM stays
+	// so the grace period watches the whole group and not only the child
+	for end := time.Now().Add(grace); time.Now().Before(end); time.Sleep(tick) {
+		if !groupAlive(group) {
+			<-exited
+			return ErrTimeout
+		}
 	}
+	_ = syscall.Kill(group, syscall.SIGKILL)
+	<-exited
 	return ErrTimeout
 }
 
-// 같은 경로를 잡은 다른 프로세스가 놓을 때까지 기다려 배타 잠금
-// 프로세스가 끝나면 커널이 풀어 상태 파일이 아님
+// Signal 0 checks the group without touching it
+// ESRCH means no member is left
+func groupAlive(group int) bool {
+	return !errors.Is(syscall.Kill(group, 0), syscall.ESRCH)
+}
+
+// An exclusive lock that waits for any other process holding the same path
+// The kernel releases it when the process ends so it never leaves stale state
 func Lock(path string) (unlock func(), err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -93,19 +117,21 @@ func Lock(path string) (unlock func(), err error) {
 		_ = f.Close()
 		return nil, err
 	}
-	// 파일을 닫으면 flock도 풀림
+	// Closing the file releases the flock
 	return func() { _ = f.Close() }, nil
 }
 
-// 실패 원인을 보여 줄 로그 끝 n줄
-func Tail(path string, n int) string {
+// The last log lines that show why a child failed and then the log path
+// An empty or unreadable log gives the path alone
+func LogTail(path string) string {
 	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+	tail := strings.TrimSpace(string(b))
+	if err != nil || tail == "" {
+		return "log: " + path
 	}
-	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
+	lines := strings.Split(tail, "\n")
+	if len(lines) > tailLines {
+		lines = lines[len(lines)-tailLines:]
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n") + "\nlog: " + path
 }
