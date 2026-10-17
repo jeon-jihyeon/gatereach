@@ -28,7 +28,7 @@ jobs:
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14
-      # Includes the launcher tests in plugin/, which run bin/gatereach against fake curl and go
+      # Includes the launcher tests in plugin/ that run bin/gatereach against fake curl and go
       - run: go test -race -cover ./...
       # The integration tests skip when redis-server isn't installed
       - if: matrix.os == 'ubuntu-latest'

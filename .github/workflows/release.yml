@@ -25,17 +25,21 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # The tag must equal the plugin version, because bin/gatereach fetches the release of that version
+          # A module or build cache restored from another run could slip into the release
+          cache: false
+      # The tag must equal the plugin version since bin/gatereach fetches the release of that version
       - name: Tag matches plugin.json
         run: test "v$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' .claude-plugin/plugin.json | head -n 1)" = "$GITHUB_REF_NAME"
       # Publishes a draft so the release appears only once every archive is uploaded and attested
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          # An exact version so a new GoReleaser release can't change what ships
+          version: v2.18.3
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # The launcher compares this with the plugin version, so a binary that answers another one never ships
+      # The launcher compares this with the plugin version
+      # so a binary that answers another one never ships
       - name: Binary version matches the tag
         run: test "v$(dist/gatereach_linux_amd64_v1/gatereach --version)" = "$GITHUB_REF_NAME"
       # `gh attestation verify <archive> --repo jeon-jihyeon/gatereach` checks an archive was built here from the tag
