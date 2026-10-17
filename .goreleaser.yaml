@@ -6,7 +6,13 @@ builds:
     binary: gatereach
     env:
       - CGO_ENABLED=0
-    # The only source of the version, so the code holds no number that could drift from the tag
+    # 1. No path of the build machine lands in the binary
+    # 2. The binary's file time comes from the commit instead of the build
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    # The only source of the version
+    # so the code holds no number that could drift from the tag
     ldflags:
       - -s -w -X github.com/jeon-jihyeon/gatereach/internal/version.Version={{ .Version }}
     goos:
