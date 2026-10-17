@@ -1,29 +1,33 @@
-// Package record는 모든 소스가 내보내는 단일 레코드
+// Package record is the one record shape every source emits
 package record
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
-// 소스 하나의 결과 한 건
-// 값 타입은 아래로 한정
-// 1. nil과 bool
-// 2. int64와 float64
+// One result row of a source
+// Values are limited to these types
+// 1. nil and bool
+// 2. int64 and float64
 // 3. string
-// 4. `map[string]any`와 `[]any`
-// NULL은 nil이고 문자열 `"NULL"`과 구분
+// 4. `map[string]any` and `[]any`
+// NULL is nil and stays apart from the string `"NULL"`
 type Record struct {
 	names  []string
 	values []any
 }
 
-// names와 values는 같은 길이
+// The caller keeps names and values the same length
 func New(names []string, values []any) Record {
 	return Record{names: names, values: values}
 }
@@ -34,7 +38,6 @@ func (r Record) Values() []any { return r.values }
 
 func (r Record) Len() int { return len(r.names) }
 
-// 없는 필드는 ok false
 func (r Record) Get(name string) (any, bool) {
 	for i, n := range r.names {
 		if n == name {
@@ -44,7 +47,7 @@ func (r Record) Get(name string) (any, bool) {
 	return nil, false
 }
 
-// 필드 순서를 지킨 JSON 객체
+// A JSON object in field order
 func (r Record) JSON() []byte {
 	var b bytes.Buffer
 	writeObject(&b, r.names, r.values)
@@ -57,9 +60,9 @@ func ValueJSON(v any) string {
 	return b.String()
 }
 
-// 폴링 중복 판별 기준
-// key 필드가 있으면 그 값
-// 없으면 키를 정렬한 레코드 전체
+// What tells polled records apart
+// 1. The key field's value when the record has it
+// 2. Otherwise the whole record with its keys sorted
 func (r Record) Identity(key string) []byte {
 	if key != "" {
 		if v, ok := r.Get(key); ok {
@@ -83,25 +86,37 @@ func (r Record) Identity(key string) []byte {
 	return b.Bytes()
 }
 
-// 같은 이름 열은 name → name_2 → name_3 순
+// Repeated column names become name → name_2 → name_3
+// A suffix skips every name already in the list so `id id id_2` gives `id id_3 id_2`
 func UniqueNames(names []string) []string {
-	seen := map[string]int{}
+	taken := make(map[string]bool, len(names))
+	for _, n := range names {
+		taken[n] = true
+	}
+	first := make(map[string]bool, len(names))
+	next := map[string]int{}
 	out := make([]string, len(names))
 	for i, n := range names {
-		seen[n]++
-		if seen[n] == 1 {
+		if !first[n] {
+			first[n] = true
 			out[i] = n
 			continue
 		}
-		out[i] = fmt.Sprintf("%s_%d", n, seen[n])
+		k := max(next[n], 2)
+		for taken[fmt.Sprintf("%s_%d", n, k)] {
+			k++
+		}
+		out[i] = fmt.Sprintf("%s_%d", n, k)
+		taken[out[i]] = true
+		next[n] = k + 1
 	}
 	return out
 }
 
-// JSON 값 하나를 레코드 값 타입으로 정규화
-// 소수점이나 지수가 없는 숫자는 int64
-// 그 밖의 숫자는 float64
-// int64를 넘는 정수는 정밀도 보존을 위해 문자열
+// Maps a JSON value onto the record value types
+// 1. A number without a decimal point or exponent is int64
+// 2. Any other number is float64
+// 3. An integer past int64 or a number past float64 is a string to keep its value
 func Normalize(v any) any {
 	switch x := v.(type) {
 	case json.Number:
@@ -112,8 +127,10 @@ func Normalize(v any) any {
 			}
 			return s
 		}
-		f, _ := strconv.ParseFloat(s, 64)
-		return f
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+		return s
 	case map[string]any:
 		out := make(map[string]any, len(x))
 		for k, e := range x {
@@ -134,7 +151,7 @@ func Normalize(v any) any {
 	return v
 }
 
-// 필드 순서를 지키며 JSON 객체 하나를 레코드로 읽음
+// Keeps the field order of the JSON object
 func FromJSON(data []byte) (Record, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -143,7 +160,7 @@ func FromJSON(data []byte) (Record, error) {
 		return Record{}, err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return Record{}, fmt.Errorf("레코드는 JSON 객체여야 함")
+		return Record{}, errors.New("a record must be a JSON object")
 	}
 	var names []string
 	var values []any
@@ -158,6 +175,13 @@ func FromJSON(data []byte) (Record, error) {
 		}
 		names = append(names, tok.(string))
 		values = append(values, Normalize(v))
+	}
+	// More stops at the end of the input too so a cut object needs its closing brace checked
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return Record{}, errors.New("a record must be one whole JSON object")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return Record{}, errors.New("a record must be one whole JSON object")
 	}
 	return Record{names: names, values: values}, nil
 }
@@ -175,8 +199,7 @@ func writeObject(b *bytes.Buffer, names []string, values []any) {
 	b.WriteByte('}')
 }
 
-// 실수는 정수 값이어도 소수점을 붙여 다시 읽을 때 int64와 구분
-// JSON에 없는 NaN과 무한대는 null
+// Map keys are sorted so the same value always gives the same bytes
 func writeValue(b *bytes.Buffer, v any) {
 	switch x := v.(type) {
 	case nil:
@@ -210,8 +233,9 @@ func writeValue(b *bytes.Buffer, v any) {
 		}
 		b.WriteByte(']')
 	default:
-		// 허용 밖 타입은 정규화하고 그래도 모르면 텍스트로 남겨 무한 재귀 차단
-		if n := Normalize(v); !sameType(n, v) {
+		// Other types are normalized first and anything still unknown becomes text
+		// so this never recurses forever
+		if n := Normalize(v); reflect.TypeOf(n) != reflect.TypeOf(v) {
 			writeValue(b, n)
 			return
 		}
@@ -219,8 +243,8 @@ func writeValue(b *bytes.Buffer, v any) {
 	}
 }
 
-// 정수 값 실수에 `.0`을 붙여 다시 읽을 때 int64와 구분
-// NaN과 무한대는 null
+// 1. An integer-valued float gets `.0` so it reads back apart from int64
+// 2. NaN and infinity have no JSON form and become null
 func formatFloat(f float64) string {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return "null"
@@ -234,34 +258,71 @@ func formatFloat(f float64) string {
 
 const hexDigits = "0123456789abcdef"
 
-func sameType(a, b any) bool {
-	return fmt.Sprintf("%T", a) == fmt.Sprintf("%T", b)
+// Runes escaped so a value can't hide text or reorder what a terminal or a reader shows
+// 1. C1 controls U+0080 to U+009F
+// 2. Line and paragraph separators U+2028 and U+2029 that end a line in JavaScript
+// 3. Bidi marks U+200E U+200F and U+061C and the embeddings and isolates U+202A to U+202E and U+2066 to U+2069
+func hiddenRune(r rune) bool {
+	switch {
+	case r >= 0x80 && r <= 0x9f, r == 0x2028, r == 0x2029, r == 0x200e, r == 0x200f, r == 0x061c:
+		return true
+	case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+		return true
+	}
+	return false
 }
 
-// HTML 문자와 비ASCII를 그대로 둔 JSON 문자열
-// 레코드마다 부르는 경로라 인코더를 만들지 않고 직접 이스케이프
-// 잘못된 UTF-8은 대체 문자로 바꿈
+// A JSON string that leaves HTML characters and non-ASCII as is apart from hiddenRune
+// It runs for every string of every record
+// 1. It escapes by hand instead of building an encoder
+// 2. Runs of bytes that need no escape are copied in one write
+// 3. Invalid UTF-8 becomes the replacement character
 func writeString(b *bytes.Buffer, s string) {
 	b.WriteByte('"')
-	for _, r := range s {
-		switch {
-		case r == '"':
-			b.WriteString(`\"`)
-		case r == '\\':
-			b.WriteString(`\\`)
-		case r == '\n':
-			b.WriteString(`\n`)
-		case r == '\r':
-			b.WriteString(`\r`)
-		case r == '\t':
-			b.WriteString(`\t`)
-		case r < 0x20:
-			b.WriteString(`\u00`)
-			b.WriteByte(hexDigits[r>>4])
-			b.WriteByte(hexDigits[r&0xf])
-		default:
-			b.WriteRune(r)
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			switch {
+			case r == utf8.RuneError && size == 1:
+				b.WriteString(s[start:i])
+				b.WriteRune(utf8.RuneError)
+				start = i + size
+			case hiddenRune(r):
+				b.WriteString(s[start:i])
+				b.WriteString(`\u`)
+				for shift := 12; shift >= 0; shift -= 4 {
+					b.WriteByte(hexDigits[r>>shift&0xf])
+				}
+				start = i + size
+			}
+			i += size
+			continue
 		}
+		if c >= 0x20 && c != '"' && c != '\\' {
+			i++
+			continue
+		}
+		b.WriteString(s[start:i])
+		switch c {
+		case '"', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteString(`\u00`)
+			b.WriteByte(hexDigits[c>>4])
+			b.WriteByte(hexDigits[c&0xf])
+		}
+		i++
+		start = i
 	}
+	b.WriteString(s[start:])
 	b.WriteByte('"')
 }

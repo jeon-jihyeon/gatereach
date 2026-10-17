@@ -15,6 +15,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/jeon-jihyeon/gatereach/internal/config"
+	"github.com/jeon-jihyeon/gatereach/internal/proc"
 )
 
 const (
@@ -22,7 +23,7 @@ const (
 	testTick = 20 * time.Millisecond
 )
 
-// 열린 포트 하나
+// A port that stays open for the test
 func listen(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -31,7 +32,7 @@ func listen(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-// 닫힌 포트 하나
+// A port nothing listens on
 func freePort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -41,8 +42,8 @@ func freePort(t *testing.T) int {
 	return p
 }
 
-// 테스트 바이너리를 터널 대신 띄우는 도우미 모드
-// 값의 포트를 2초 동안 열어 둠
+// Helper mode that runs the test binary in place of a tunnel
+// It holds the port named in the value open for 2 seconds
 const listenEnv = "GATEREACH_TEST_LISTEN"
 
 func TestMain(m *testing.M) {
@@ -58,16 +59,25 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// 포트를 여는 도우미 자식의 명령줄과 환경
+// Command line and environment of a helper child that opens the port
 func listener(port int) ([]string, []string) {
 	return []string{os.Args[0]}, append(os.Environ(), listenEnv+"="+strconv.Itoa(port))
 }
 
 func conn(port int) config.Conn {
-	return config.Conn{Client: "mysql", Host: "127.0.0.1", Port: port, User: "u", Tunnel: &config.Tunnel{Type: "tsh", Target: "t"}}
+	return config.Conn{
+		Client: "mysql",
+		Host:   "127.0.0.1",
+		Port:   port,
+		User:   "u",
+		Tunnel: &config.Tunnel{Type: "tsh", Target: "t"},
+	}
 }
 
-// GATEREACH_CONFIG를 바꾸므로 병렬 실행하지 않음
+// What the owner check returns for a port of another user
+var errOtherUser = errors.New("a port 1 is held by another user\nclose that listener or change the port")
+
+// Not parallel since it sets GATEREACH_CONFIG and swaps checkOwner
 func TestOpen(t *testing.T) {
 	t.Setenv("GATEREACH_CONFIG", filepath.Join(t.TempDir(), "conns.toml"))
 	listening := listen(t)
@@ -75,56 +85,74 @@ func TestOpen(t *testing.T) {
 		result Result
 		err    string
 	}
+	// A nil init means the connection has no tunnel
+	// A non-nil owner is what the owner check returns
 	tcs := []struct {
-		name   string
-		port   int
-		noKind bool
-		init   func(k *MockKind, port int)
-		want   want
+		name  string
+		port  int
+		init  func(k *MockKind, port int)
+		owner error
+		want  want
 	}{
-		{"our tunnel holds the port", listening, false, func(k *MockKind, _ int) {
+		{"our tunnel holds the port", listening, func(k *MockKind, _ int) {
 			k.EXPECT().Pids(gomock.Any()).Return([]int{1}, nil)
-		}, want{result: Already}},
-		{"another program holds the port", listening, false, func(k *MockKind, _ int) {
+		}, nil, want{result: Already}},
+		{"another program holds the port", listening, func(k *MockKind, _ int) {
 			k.EXPECT().Pids(gomock.Any()).Return(nil, nil)
-		}, want{result: Foreign}},
-		{"process list fails", listening, false, func(k *MockKind, _ int) {
-			k.EXPECT().Pids(gomock.Any()).Return(nil, errors.New("ps 실패"))
-		}, want{err: "ps 실패"}},
-		{"direct connection", listening, true, nil, want{result: Already}},
-		{"closed port without a tunnel", freePort(t), true, nil, want{err: "닫혀 있고 터널 설정 없음"}},
-		{"starts and waits for the port", freePort(t), false, func(k *MockKind, port int) {
+		}, nil, want{result: Foreign}},
+		{"another user holds the port", listening, func(*MockKind, int) {}, errOtherUser, want{err: errOtherUser.Error()}},
+		{"process list fails", listening, func(k *MockKind, _ int) {
+			k.EXPECT().Pids(gomock.Any()).Return(nil, errors.New("ps failed"))
+		}, nil, want{err: "ps failed"}},
+		{"direct connection skips the owner check", listening, nil, errOtherUser, want{result: Already}},
+		{"closed port without a tunnel", freePort(t), nil, nil, want{err: "a is closed with no tunnel configured"}},
+		{"starts and waits for the port", freePort(t), func(k *MockKind, port int) {
 			k.EXPECT().Command(gomock.Any()).Return(listener(port))
-		}, want{result: Opened}},
-		{"early exit shows the log", freePort(t), false, func(k *MockKind, _ int) {
-			k.EXPECT().Command(gomock.Any()).Return([]string{"sh", "-c", "echo 'ERROR: not logged in' >&2; exit 3"}, os.Environ())
-		}, want{err: "ERROR: not logged in"}},
-		{"timeout asks to check the login", freePort(t), false, func(k *MockKind, _ int) {
+		}, nil, want{result: Opened}},
+		{"another user holds the port the tunnel opened", freePort(t), func(k *MockKind, port int) {
+			k.EXPECT().Command(gomock.Any()).Return(listener(port))
+		}, errOtherUser, want{err: errOtherUser.Error()}},
+		{"early exit shows the log", freePort(t), func(k *MockKind, _ int) {
+			k.EXPECT().
+				Command(gomock.Any()).
+				Return([]string{"sh", "-c", "echo 'ERROR: not logged in' >&2; exit 3"}, os.Environ())
+		}, nil, want{err: "a open failed: tunnel exit code 3\nERROR: not logged in"}},
+		{"timeout asks to check the login", freePort(t), func(k *MockKind, _ int) {
 			k.EXPECT().Command(gomock.Any()).Return([]string{"sleep", "30"}, os.Environ())
-		}, want{err: "터널 로그인 상태 확인"}},
+		}, nil, want{err: "check the tunnel login"}},
+		{"missing tunnel program", freePort(t), func(k *MockKind, _ int) {
+			k.EXPECT().Command(gomock.Any()).Return([]string{filepath.Join(t.TempDir(), "no-tsh")}, os.Environ())
+		}, nil, want{err: "a tunnel couldn't run"}},
 	}
+	t.Cleanup(func() { checkOwner = proc.CheckOwner })
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
+			checkOwner = proc.CheckOwner
+			if tc.owner != nil {
+				checkOwner = func(string, int) error { return tc.owner }
+			}
 			var k Kind
-			if !tc.noKind {
+			if tc.init != nil {
 				m := NewMockKind(gomock.NewController(t))
-				if tc.init != nil {
-					tc.init(m, tc.port)
-				}
+				tc.init(m, tc.port)
 				k = m
 			}
 			got, err := open(k, "a", conn(tc.port), testWait, testTick)
-			if tc.want.err != "" {
-				assert.ErrorContains(t, err, tc.want.err)
-				return
-			}
-			require.NoError(t, err)
 			assert.Equal(t, tc.want.result, got)
+			assert.Equal(t, tc.want.err == "", err == nil, "error: %v", err)
+			assert.Contains(t, errText(err), tc.want.err)
 		})
 	}
 }
 
-// 닫힌 별칭을 동시에 열어도 터널은 하나만 띄우고 나머지는 이미 열림
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// Concurrent opens of a closed alias start one tunnel and the rest find it already open
 func TestOpenStartsOneTunnelForConcurrentOpens(t *testing.T) {
 	t.Setenv("GATEREACH_CONFIG", filepath.Join(t.TempDir(), "conns.toml"))
 	port := freePort(t)
@@ -149,9 +177,17 @@ func TestOpenStartsOneTunnelForConcurrentOpens(t *testing.T) {
 }
 
 func TestCloseTunnel(t *testing.T) {
+	t.Parallel()
 	sleeper := exec.Command("sleep", "30")
 	require.NoError(t, sleeper.Start())
 	t.Cleanup(func() { _ = sleeper.Process.Kill() })
+	held := freePort(t)
+	argv, env := listener(held)
+	tunnel := exec.Command(argv[0])
+	tunnel.Env = env
+	require.NoError(t, tunnel.Start())
+	t.Cleanup(func() { _ = tunnel.Process.Kill() })
+	require.Eventually(t, func() bool { up, _ := IsOpen(conn(held)); return up }, testWait, testTick)
 	listening := listen(t)
 	tcs := []struct {
 		name string
@@ -161,6 +197,9 @@ func TestCloseTunnel(t *testing.T) {
 	}{
 		{"kills our tunnel", freePort(t), func(k *MockKind) {
 			k.EXPECT().Pids(gomock.Any()).Return([]int{sleeper.Process.Pid}, nil)
+		}, Closed},
+		{"waits for our tunnel to free the port", held, func(k *MockKind) {
+			k.EXPECT().Pids(gomock.Any()).Return([]int{tunnel.Process.Pid}, nil)
 		}, Closed},
 		{"keeps a foreign tunnel", listening, func(k *MockKind) {
 			k.EXPECT().Pids(gomock.Any()).Return(nil, nil)
@@ -178,12 +217,15 @@ func TestCloseTunnel(t *testing.T) {
 				tc.init(m)
 				k = m
 			}
-			got, err := closeTunnel(k, conn(tc.port))
+			got, err := closeTunnel(k, conn(tc.port), testWait, testTick)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
+			up, _ := IsOpen(conn(tc.port))
+			assert.Equal(t, tc.port == listening, up, "port open after close")
 		})
 	}
 	assert.Error(t, sleeper.Wait(), "terminated by SIGTERM")
+	assert.Error(t, tunnel.Wait(), "terminated by SIGTERM")
 }
 
 func TestNew(t *testing.T) {
@@ -200,18 +242,15 @@ func TestNew(t *testing.T) {
 	}{
 		{"no tunnel", config.Conn{}, want{}},
 		{"tsh", conn(1), want{kind: true}},
-		{"unknown kind", config.Conn{Tunnel: &config.Tunnel{Type: "ssh"}}, want{err: "지원하지 않는 터널"}},
+		{"unknown kind", config.Conn{Tunnel: &config.Tunnel{Type: "ssh"}}, want{err: "unsupported tunnel"}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			k, err := New(cfg, tc.conn)
-			if tc.want.err != "" {
-				assert.ErrorContains(t, err, tc.want.err)
-				return
-			}
-			require.NoError(t, err)
 			assert.Equal(t, tc.want.kind, k != nil)
+			assert.Equal(t, tc.want.err == "", err == nil, "error: %v", err)
+			assert.Contains(t, errText(err), tc.want.err)
 		})
 	}
 }

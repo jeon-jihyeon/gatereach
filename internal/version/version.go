@@ -1,4 +1,4 @@
-// Package version은 빌드 버전
+// Package version holds the build version
 package version
 
 import (
@@ -6,9 +6,9 @@ import (
 	"strings"
 )
 
-// 릴리스 빌드는 `-ldflags -X`로 앞의 v를 뺀 태그 값 주입
-// 코드에 버전 번호를 두지 않아 plugin.json과 어긋날 수 없음
-var Version = ""
+// Release builds inject the tag without its leading v through `-ldflags -X`
+// No version number lives in the code so it can't drift from plugin.json
+var Version string
 
 func init() {
 	if Version == "" {
@@ -16,12 +16,17 @@ func init() {
 	}
 }
 
-// go install로 받은 빌드는 모듈 버전 사용
-// 로컬 빌드는 dev
+// 1. A build from go install uses the module version
+// 2. A local build is dev even though Go stamps it with the checkout's tag and VCS state
 func fromBuildInfo() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok || !strings.HasPrefix(info.Main.Version, "v") {
 		return "dev"
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" {
+			return "dev"
+		}
 	}
 	return strings.TrimPrefix(info.Main.Version, "v")
 }

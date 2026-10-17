@@ -1,4 +1,4 @@
-// Package cli는 모든 패키지를 아는 유일한 진입점
+// Package cli is the only entry point that knows every package
 package cli
 
 import (
@@ -11,7 +11,6 @@ import (
 
 	"github.com/jeon-jihyeon/gatereach/internal/clients"
 	"github.com/jeon-jihyeon/gatereach/internal/config"
-	"github.com/jeon-jihyeon/gatereach/internal/sinks"
 	"github.com/jeon-jihyeon/gatereach/internal/tunnels"
 	"github.com/jeon-jihyeon/gatereach/internal/version"
 )
@@ -19,7 +18,7 @@ import (
 const (
 	exitError = 1
 	exitUsage = 2
-	// 중단으로 끝난 단건 조회
+	// A single read stopped by SIGINT, SIGTERM or SIGHUP
 	exitInterrupted = 130
 )
 
@@ -38,21 +37,21 @@ type command struct {
 
 func commands() map[string]command {
 	return map[string]command{
-		"ls":    {usage: "ls", help: "연결 목록과 터널과 세션 상태", run: (*app).ls},
-		"open":  {usage: "open <alias>", help: "터널 열기와 세션 시작", run: (*app).open},
-		"close": {usage: "close <alias|all>", help: "세션 종료와 gatereach가 연 터널 닫기", run: (*app).close},
+		"ls":    {usage: "ls", help: "list connections with their tunnel and session state", run: (*app).ls},
+		"open":  {usage: "open <alias>", help: "open the tunnel and start the session", run: (*app).open},
+		"close": {usage: "close <alias|all>", help: "stop the session and close tunnels gatereach opened", run: (*app).close},
 		"q": {
-			usage: "q <alias> <query> [options]  또는  q <alias> --file <path> [options]",
-			help:  "조회 결과를 레코드마다 JSON 한 줄로 출력하거나 --out 폴더에 저장\n닫힌 터널과 세션은 자동으로 열고 유지",
+			usage: "q <alias> <query> [options]  or  q <alias> --file <path> [options]",
+			help:  "print one JSON line per record or save to the --out folder\nopens closed tunnels and sessions and keeps them up",
 			run:   (*app).query,
 		},
-		"discover": {usage: "discover " + strings.Join(tunnels.Names(), "|"), help: "터널로 접근 가능한 대상 목록", run: (*app).discover},
-		"add":      {usage: "add <alias> --client " + strings.Join(clients.Names(), "|") + " [options]", help: "설정 파일에 연결 추가", run: (*app).add},
+		"discover": {usage: "discover " + strings.Join(tunnels.Names(), "|"), help: "list targets the tunnel can reach", run: (*app).discover},
+		"add":      {usage: "add <alias> --client " + strings.Join(clients.Names(), "|") + " [options]", help: "add a connection to the config file", run: (*app).add},
 		"serve":    {usage: "serve <alias>", run: (*app).serve, hidden: true},
 	}
 }
 
-// 명령이 돌려준 오류의 종료 코드
+// An error that sets the exit code of a command
 type exitCode struct {
 	code int
 	msg  string
@@ -72,13 +71,13 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	cmd, ok := cmds[args[0]]
 	if !ok {
-		fmt.Fprintf(stderr, "알 수 없는 명령: %s\n", args[0])
+		fmt.Fprintf(stderr, "unknown command: %s\n", clean(args[0]))
 		usage(stderr, cmds)
 		return exitUsage
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, clean(err.Error()))
 		return exitError
 	}
 	a := &app{cfg: cfg, stdout: stdout, stderr: stderr}
@@ -89,18 +88,16 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case errors.As(err, &code):
 		if code.msg != "" {
-			fmt.Fprintln(stderr, code.msg)
+			fmt.Fprintln(stderr, clean(code.msg))
 		}
 		return code.code
-	case errors.Is(err, flag.ErrHelp):
-		return exitUsage
 	}
-	fmt.Fprintln(stderr, err)
+	fmt.Fprintln(stderr, clean(err.Error()))
 	return exitError
 }
 
 func usage(w io.Writer, cmds map[string]command) {
-	fmt.Fprintln(w, "gatereach: 터널과 자격 증명 뒤의 데이터 소스를 별칭으로 조회")
+	fmt.Fprintln(w, "gatereach: query data sources behind tunnels and credentials by alias")
 	names := make([]string, 0, len(cmds))
 	for n, c := range cmds {
 		if !c.hidden {
@@ -114,16 +111,17 @@ func usage(w io.Writer, cmds map[string]command) {
 }
 
 func usageError(name string) error {
-	return fmt.Errorf("사용법: gatereach %s", commands()[name].usage)
+	return fmt.Errorf("usage: gatereach %s", commands()[name].usage)
 }
 
-// 플래그와 위치 인자를 섞어 쓸 수 있게 반복 해석
-// `--` 뒤는 모두 위치 인자라 -로 시작하는 쿼리도 받음
+// Parse in a loop so flags and positional arguments can mix
+// Everything after `--` is positional so a query may start with -
+// A bad flag exits 2 with nothing more since the flag set already printed the error and usage
 func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 	var pos []string
 	for len(args) > 0 {
 		if err := fs.Parse(args); err != nil {
-			return nil, err
+			return nil, exitCode{code: exitUsage}
 		}
 		rest := fs.Args()
 		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
@@ -149,9 +147,9 @@ func (a *app) conn(alias string) (config.Conn, error) {
 	if !ok {
 		known := strings.Join(a.cfg.Aliases, " ")
 		if known == "" {
-			known = "없음"
+			known = "none"
 		}
-		return config.Conn{}, fmt.Errorf("알 수 없는 별칭: %s\n가능: %s", alias, known)
+		return config.Conn{}, fmt.Errorf("unknown alias: %s\navailable: %s", alias, known)
 	}
 	return c, nil
 }
@@ -163,6 +161,19 @@ func or(s, fallback string) string {
 	return s
 }
 
-func formatHelp() string {
-	return "--out 데이터 파일 형식: " + strings.Join(sinks.FormatNames(), " 또는 ")
+// Text from a source or a tunnel tool can carry terminal escapes
+// that rewrite the screen or the title when printed raw
+// 1. C0 controls except newline and tab become \u00XX
+// 2. DEL and C1 controls become \u00XX too
+// 3. Invalid UTF-8 becomes U+FFFD so a lone C1 byte can't pass either
+func clean(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r < 0x20 && r != '\n' && r != '\t') || (r >= 0x7f && r <= 0x9f) {
+			fmt.Fprintf(&b, `\u%04X`, r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

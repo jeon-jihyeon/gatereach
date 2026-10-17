@@ -12,12 +12,12 @@ import (
 	"github.com/jeon-jihyeon/gatereach/internal/config"
 )
 
-// Teleport 프로토콜 → gatereach client
+// Teleport protocol → gatereach client
 var tshClients = map[string]string{"mysql": "mysql", "redis": "redis"}
 
 type tsh struct {
 	tool config.Tool
-	// 내 계정의 프로세스 목록
+	// The current user's process list
 	ps func() ([]byte, error)
 }
 
@@ -29,7 +29,7 @@ func listProcesses() ([]byte, error) {
 	return exec.Command("ps", "-ww", "-U", strconv.Itoa(os.Getuid()), "-o", "pid=,command=").Output()
 }
 
-// Teleport Connect 앱이 보관한 프로필을 쓰려면 TELEPORT_HOME 지정
+// TELEPORT_HOME points tsh at the profiles the Teleport Connect app keeps
 func (t tsh) env() []string {
 	if t.tool.Home == "" {
 		return os.Environ()
@@ -37,20 +37,26 @@ func (t tsh) env() []string {
 	return append(os.Environ(), "TELEPORT_HOME="+t.tool.Home)
 }
 
+// The = form and the -- before the target keep a value that starts with a dash from reading as a flag
+// tsh parses with kingpin which takes everything after -- as arguments
 func (t tsh) argv(conn config.Conn) []string {
-	return []string{t.tool.Bin, "proxy", "db", "--tunnel", "--port", strconv.Itoa(conn.Port), "--db-user", conn.User, conn.Tunnel.Target}
+	return []string{
+		t.tool.Bin, "proxy", "db", "--tunnel", "--port", strconv.Itoa(conn.Port), "--db-user=" + conn.User,
+		"--", conn.Tunnel.Target,
+	}
 }
 
 func (t tsh) Command(conn config.Conn) ([]string, []string) {
 	return t.argv(conn), t.env()
 }
 
-// Teleport Connect 앱 같은 다른 프로세스가 연 터널은 명령줄이 달라 제외
+// A tunnel another program such as the Teleport Connect app opened has a different command line
+// so it's left out
 func (t tsh) Pids(conn config.Conn) ([]int, error) {
 	want := strings.Join(t.argv(conn), " ")
 	out, err := t.ps()
 	if err != nil {
-		return nil, fmt.Errorf("프로세스 목록 조회 실패: %w", err)
+		return nil, fmt.Errorf("process list failed: %w", err)
 	}
 	var found []int
 	for _, line := range strings.Split(string(out), "\n") {
@@ -82,22 +88,24 @@ func (t tsh) Discover() ([]Target, error) {
 	cmd := exec.Command(t.tool.Bin, "db", "ls", "--format", "json")
 	cmd.Env = t.env()
 	out, err := cmd.Output()
-	if err != nil {
-		detail := err.Error()
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			detail = strings.TrimSpace(string(ee.Stderr))
-		}
-		return nil, fmt.Errorf("tsh db ls 실패: tsh 로그인 확인\n%s", detail)
+	// Only an exit of tsh itself points at the login
+	// A missing binary gets the plain cause instead
+	var ee *exec.ExitError
+	switch {
+	case errors.As(err, &ee):
+		return nil, fmt.Errorf("tsh db ls failed: check the tsh login\n%s", strings.TrimSpace(string(ee.Stderr)))
+	case err != nil:
+		return nil, fmt.Errorf("tsh db ls couldn't run: %w", err)
 	}
 	return parseTshDatabases(out)
 }
 
-// 이름은 discovered-name 라벨을 먼저 쓰고 없으면 리소스 이름
+// The name is the discovered-name label when present
+// and the resource name otherwise
 func parseTshDatabases(out []byte) ([]Target, error) {
 	var dbs []tshDatabase
 	if err := json.Unmarshal(out, &dbs); err != nil {
-		return nil, fmt.Errorf("tsh db ls 출력 해석 실패: %w", err)
+		return nil, fmt.Errorf("couldn't parse tsh db ls output: %w", err)
 	}
 	targets := make([]Target, len(dbs))
 	for i, db := range dbs {

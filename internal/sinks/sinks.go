@@ -1,4 +1,4 @@
-// Package sinks는 Record 스트림을 stdout이나 Data Package 폴더로 출력
+// Package sinks writes a Record stream to stdout or a Data Package folder
 package sinks
 
 import (
@@ -11,15 +11,15 @@ import (
 	"github.com/jeon-jihyeon/gatereach/internal/record"
 )
 
-// Write를 레코드마다 부르고 Close를 끝에 한 번 부름
+// Write is called once per record and Close once at the end
 type Sink interface {
 	Write(r record.Record) error
-	// 실패로 끝났으면 err에 원인
-	// 출력 자체가 실패했으면 오류 반환
+	// err holds the cause when the run failed
+	// The returned error means the output itself failed
 	Close(err error) error
 }
 
-// datapackage.json과 Arrow 스키마 메타데이터에 같은 규칙으로 기록
+// Recorded the same way in datapackage.json and the Arrow schema metadata
 type Meta struct {
 	Version string
 	Alias   string
@@ -32,10 +32,10 @@ type Meta struct {
 	Started time.Time
 }
 
-// 초 단위와 지역 시간대 오프셋
+// Seconds with the local time zone offset
 const startedLayout = "2006-01-02T15:04:05-07:00"
 
-// complete가 nil이면 실행 결과 없이 시작 정보만
+// A nil complete gives only the start details without the run's outcome
 func (m Meta) entries(complete *bool, errText string) ordered {
 	out := ordered{{"version", m.Version}, {"alias", m.Alias}, {"client", m.Client}}
 	if m.User != "" {
@@ -63,8 +63,8 @@ func FormatNames() []string {
 	return out
 }
 
-// out이 비면 stdout JSON lines
-// 그 밖에는 Data Package 폴더
+// An empty out gives stdout JSON lines
+// Anything else gives a Data Package folder
 func Get(out, format string, meta Meta, stdout, stderr io.Writer) (Sink, error) {
 	if out == "" {
 		return NewJSONLines(stdout, stderr, meta.Follow), nil
@@ -72,13 +72,13 @@ func Get(out, format string, meta Meta, stdout, stderr io.Writer) (Sink, error) 
 	return NewPackage(out, format, meta, stdout, stderr)
 }
 
-// 세션이 보낸 레코드 JSON을 다시 만들지 않고 그대로 쓰는 출력
+// Output that writes the session's record JSON as is instead of building it again
 type RawWriter interface {
 	WriteRaw(line []byte) error
 }
 
-// 레코드마다 JSON 한 줄
-// follow가 아니면 버퍼가 찰 때와 끝날 때만 내보냄
+// One JSON line per record
+// Without follow it flushes only when the buffer fills and at the end
 type JSONLines struct {
 	w      *bufio.Writer
 	errw   io.Writer
@@ -112,8 +112,12 @@ func (j *JSONLines) Close(err error) error {
 	flushErr := j.w.Flush()
 	suffix := ""
 	if err != nil || flushErr != nil {
-		suffix = ", 실패로 중단"
+		suffix = ", stopped by a failure"
 	}
-	fmt.Fprintf(j.errw, "(%d rows%s)\n", j.rows, suffix)
+	unit := "rows"
+	if j.rows == 1 {
+		unit = "row"
+	}
+	fmt.Fprintf(j.errw, "(%d %s%s)\n", j.rows, unit, suffix)
 	return flushErr
 }

@@ -17,7 +17,6 @@ import (
 	"github.com/jeon-jihyeon/gatereach/internal/record"
 )
 
-// 로컬 redis-server가 있을 때만 실행
 func TestRedisAgainstALocalServer(t *testing.T) {
 	bin, err := exec.LookPath("redis-server")
 	if err != nil {
@@ -47,5 +46,24 @@ func TestRedisAgainstALocalServer(t *testing.T) {
 	require.NoError(t, c.Read(ctx, Query{Text: "GET missing", Limit: 10}, emit))
 	assert.Equal(t, `{"value":null}`, string(got[0].JSON()))
 	err = c.Read(ctx, Query{Text: "HGETALL", Limit: 10}, emit)
-	assert.ErrorContains(t, err, "redis 오류 응답")
+	assert.ErrorContains(t, err, "redis error reply")
+
+	// The bounds ask the server first and their replies count toward --max
+	var used []float64
+	use := func(amount float64) error { used = append(used, amount); return nil }
+	err = c.Read(ctx, Query{Text: "HGETALL h", Limit: 1, Use: use}, emit)
+	assert.EqualError(t, err, "h holds 2 items, more than --limit 1\nuse HSCAN to page through it")
+	require.NoError(t, c.Read(ctx, Query{Text: "RPUSH l a b c d", Write: true, Limit: 10}, emit))
+	got = nil
+	require.NoError(t, c.Read(ctx, Query{Text: "LRANGE l -2 -1", Limit: 2, Use: use}, emit))
+	assert.Len(t, got, 2)
+	err = c.Read(ctx, Query{Text: "LRANGE l 0 -1", Limit: 2}, emit)
+	assert.EqualError(t, err, "LRANGE asks for 4 items, more than --limit 2\nnarrow the range or raise --limit")
+	require.NoError(t, c.Read(ctx, Query{Text: "ZADD z 1 a 2 b 3 c", Write: true, Limit: 10}, emit))
+	got = nil
+	require.NoError(t, c.Read(ctx, Query{Text: "ZRANGEBYSCORE z -inf +inf", Limit: 2, Use: use}, emit))
+	assert.Len(t, got, 2)
+	assert.Equal(t, []float64{1, 3, 2}, used)
+	err = c.Read(ctx, Query{Text: "HGETALL l", Limit: 10}, emit)
+	assert.ErrorContains(t, err, "redis error reply: WRONGTYPE")
 }

@@ -2,9 +2,10 @@
 # ~/.config is used when XDG_CONFIG_HOME isn't set
 # GATEREACH_CONFIG points to a different file
 
-# Tunnel tool settings, needed only when the defaults don't fit
+# Tunnel tool settings
+# They're needed only when the defaults don't fit
 # bin is the tsh to run when tsh isn't on PATH
-# home sets TELEPORT_HOME, so tsh uses the profile Teleport Connect keeps
+# home sets TELEPORT_HOME so tsh uses the profile Teleport Connect keeps
 # [tunnels.tsh]
 # bin = "/opt/homebrew/bin/tsh"
 # home = "~/Library/Application Support/Teleport Connect/tsh"
@@ -19,12 +20,16 @@ port = 26344
 user = "viewer"
 # database = "orders"
 # tls = true
+# q takes --write only for an alias with write = true
+# gatereach add never sets it so only you can turn it on here
+# write = true
 
 [conns.orders-staging.tunnel]
 type = "tsh"
 target = "orders-staging"
 
-# Redis reached directly, password read from the macOS Keychain
+# Redis reached directly
+# The password comes from the macOS Keychain
 [conns.cache-local]
 client = "redis"
 host = "127.0.0.1"
@@ -33,13 +38,29 @@ secret = "keychain:cache-local"
 # user = "reader"
 # tls = true
 
-# DynamoDB through an AWS profile, no host or port
+# DynamoDB through an AWS profile
+# It takes no host or port
 [conns.events-ddb]
 client = "dynamodb"
 profile = "dev"
-region = "ap-northeast-2"
+region = "us-west-2"
+
+# Athena through an AWS profile
+# It takes no host or port
+# workgroup is required
+# Leave output_location out to use the workgroup's result location
+# catalog defaults to AwsDataCatalog
+[conns.acme-athena]
+client = "athena"
+profile = "dev"
+region = "us-east-1"
+workgroup = "primary"
+database = "acme"
+# output_location = "s3://example-bucket/athena-results/"
+# catalog = "AwsDataCatalog"
 
 # Kafka with SASL
+# An env secret must name a variable that starts with GATEREACH_
 # A secret switches on SASL_SSL with PLAIN and needs a user
 # Without a secret, tls = true still turns on TLS
 [conns.events-kafka]
@@ -47,4 +68,4 @@ client = "kafka"
 host = "broker.example.com"
 port = 9092
 user = "api-key"
-secret = "env:EVENTS_KAFKA_SECRET"
+secret = "env:GATEREACH_EVENTS_KAFKA_SECRET"

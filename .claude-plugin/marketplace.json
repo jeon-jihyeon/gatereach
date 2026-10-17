@@ -8,7 +8,7 @@
     {
       "name": "gatereach",
       "source": "./",
-      "description": "Query MySQL, Redis, DynamoDB and Kafka behind tunnels or credentials through saved aliases, read only by default, as JSON lines or a Data Package"
+      "description": "Query MySQL, Redis, DynamoDB, Kafka and Athena behind tunnels or credentials through saved aliases, read only by default, as JSON lines or a Data Package"
     }
   ]
 }

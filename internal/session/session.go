@@ -1,4 +1,4 @@
-// Package session은 별칭마다 소스 연결을 쥐고 Unix 소켓으로 요청을 받는 상주 프로세스
+// Package session is the resident process per alias that holds the source connection and takes requests over a Unix socket
 package session
 
 import (
@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -27,31 +28,40 @@ import (
 const (
 	startWait = 20 * time.Second
 	startTick = 100 * time.Millisecond
-	// 단건 조회가 쥔 연결의 차례를 기다리는 시간
+	// How long a single read waits for its turn on the held connection
 	busyWait = 30 * time.Second
-	// shutdown 요청 뒤 소켓이 닫히길 기다리는 시간
+	// How long a shutdown request waits for the socket to close
 	stopWait = 5 * time.Second
 	stopTick = 100 * time.Millisecond
 	dialWait = time.Second
-	// macOS sun_path 104바이트에서 끝 NUL을 뺀 길이
+	// macOS sun_path is 104 bytes including the trailing NUL
 	maxSocketPath = 103
-	// 한 줄 레코드의 최대 크기
+	// Longest reply line the caller reads
 	maxLine = 256 << 20
+	// Longest request line the session reads
+	// A query read from --file fits well under it
+	maxRequest = 4 << 20
+	// How long a new connection may take to send its request line
+	requestWait = 10 * time.Second
+	// Follows one session runs at once since each holds its own source connection
+	maxFollows = 4
+	// Shortest follow interval as the CLI also checks
+	minInterval = time.Second
 )
 
-type Op string
+type op string
 
 const (
-	OpQuery    Op = ""         // 쿼리
-	OpShutdown Op = "shutdown" // 세션 종료
+	opQuery    op = ""
+	opShutdown op = "shutdown" // accepted from any version
 )
 
-// 요청 한 줄
+// One request line
 type Request struct {
-	Op Op `json:"op,omitempty"`
-	// 세션을 띄운 바이너리의 버전과 다르면 거부해 새 바이너리가 세션을 이어받음
+	Op op `json:"op,omitempty"`
+	// A version other than the session binary's is refused so a new binary takes the session over
 	Version string `json:"version,omitempty"`
-	// 소켓 이름이 겹쳐도 다른 별칭의 세션에 쿼리가 가지 않도록 대조
+	// Checked so a query never reaches another alias's session even when socket names collide
 	Alias    string        `json:"alias"`
 	Query    string        `json:"query,omitempty"`
 	Write    bool          `json:"write,omitempty"`
@@ -59,50 +69,111 @@ type Request struct {
 	Follow   bool          `json:"follow,omitempty"`
 	Interval time.Duration `json:"interval,omitempty"`
 	Key      string        `json:"key,omitempty"`
+	// --max already in the unit of the source's Budget
+	// 0 means none
+	Max     float64       `json:"max,omitempty"`
+	Timeout time.Duration `json:"timeout,omitempty"`
 }
 
-// 응답의 마지막 줄
+// The last line of a reply
 type End struct {
 	Rows  int    `json:"rows"`
 	Error string `json:"error,omitempty"`
-	// 끊긴 연결을 다시 맺어 세션 변수와 임시 테이블이 초기화됨
+	// The dropped connection was reopened so session variables and temporary tables were reset
 	Reconnected bool `json:"reconnected,omitempty"`
-	// 세션 버전이 요청과 달라 아무것도 실행하지 않음
+	// The session version differs from the request's so nothing ran
 	Outdated bool `json:"outdated,omitempty"`
+	// What the source read over the request when Max is set
+	Used float64 `json:"used,omitempty"`
+	// Used reached Max and ended the request
+	Spent bool `json:"spent,omitempty"`
 }
 
-// 세션이 다른 버전의 바이너리로 떠 있음
-// 호출자가 세션을 다시 띄운 뒤 요청을 다시 보냄
-var ErrOutdated = errors.New("세션 버전이 다름")
+// The session runs on another binary version
+// The caller restarts the session and sends the request again
+var ErrOutdated = errors.New("session version differs")
 
-// 클라이언트를 거치지 않은 요청도 막는 값 범위
+// Value ranges that also stop requests sent without the CLI
 func (r Request) check() error {
-	if r.Limit < 1 {
-		return errors.New("limit은 1 이상")
+	if r.Op != opQuery {
+		return fmt.Errorf("unknown op: %s", r.Op)
 	}
-	if r.Follow && r.Interval <= 0 {
-		return errors.New("interval은 0보다 커야 함")
+	if r.Limit < 1 {
+		return errors.New("limit must be at least 1")
+	}
+	if r.Follow && r.Interval < minInterval {
+		return errors.New("interval must be at least 1 second")
+	}
+	if r.Max < 0 {
+		return errors.New("max must be 0 or above")
+	}
+	if r.Timeout < 0 {
+		return errors.New("timeout must be 0 or above")
 	}
 	return nil
 }
 
-// 레코드 줄은 `{"record":...}`
-// 그 밖의 줄은 End
-const recordPrefix = `{"record":`
-
-// 설정 폴더 아래 run
-// 경로가 길어 소켓 이름이 sun_path 한도를 넘으면 `/tmp` 아래 사용자와 설정 폴더별 폴더
-func Dir() string {
-	d := filepath.Join(config.Dir(), "run")
-	if len(d)+len("/00000000.sock") <= maxSocketPath {
-		return d
+// The query a request runs and the meter its Use adds to
+// The meter is nil without Max so the source measures nothing
+func (r Request) query() (clients.Query, *meter) {
+	q := clients.Query{Text: r.Query, Write: r.Write, Limit: r.Limit, Timeout: r.Timeout}
+	if r.Max <= 0 {
+		return q, nil
 	}
-	return fmt.Sprintf("/tmp/gatereach-%d-%08x", os.Getuid(), crc32.ChecksumIEEE([]byte(config.Dir())))
+	m := &meter{max: r.Max}
+	q.Use = m.use
+	return q, m
 }
 
-// 별칭마다 소켓 하나
-// 다른 별칭이 같은 파일 이름이 되지 않도록 별칭 해시를 덧붙임
-// 경로가 sun_path 한도를 넘으면 해시만 사용
+// What the source read over one request
+// The source calls use from the request's goroutine only
+type meter struct {
+	max  float64
+	used float64
+}
+
+func (m *meter) use(amount float64) error {
+	m.used += amount
+	if m.used >= m.max {
+		return clients.ErrBudget
+	}
+	return nil
+}
+
+// A record line is `{"record":...}`
+// Any other line is End
+const recordPrefix = `{"record":`
+
+// `run` under the config folder
+// A folder per user and config folder elsewhere when that path would push socket names past the sun_path limit
+// 1. $XDG_RUNTIME_DIR which only the user can enter
+// 2. The temp folder when it isn't /tmp such as the per user one macOS keeps under /var/folders
+// 3. /tmp last since any user can create a name there first
+func Dir() string {
+	d := filepath.Join(config.Dir(), "run")
+	if fits(d) {
+		return d
+	}
+	name := fmt.Sprintf("gatereach-%d-%08x", os.Getuid(), crc32.ChecksumIEEE([]byte(config.Dir())))
+	for _, base := range []string{os.Getenv("XDG_RUNTIME_DIR"), os.TempDir()} {
+		if !filepath.IsAbs(base) || filepath.Clean(base) == "/tmp" {
+			continue
+		}
+		if d := filepath.Join(base, name); fits(d) {
+			return d
+		}
+	}
+	return filepath.Join("/tmp", name)
+}
+
+// Whether the shortest socket name still fits sun_path in folder d
+func fits(d string) bool {
+	return len(d)+len("/00000000.sock") <= maxSocketPath
+}
+
+// One socket per alias
+// The alias hash keeps two aliases from sharing a file name
+// Only the hash is used when the path would pass the sun_path limit
 func SocketPath(alias string) string {
 	p := filepath.Join(Dir(), config.FileKey(alias)+".sock")
 	if len(p) <= maxSocketPath {
@@ -112,14 +183,9 @@ func SocketPath(alias string) string {
 }
 
 func lockPath(alias string) string {
-	return filepath.Join(Dir(), filepath.Base(SocketPath(alias))+".lock")
+	return SocketPath(alias) + ".lock"
 }
 
-// 소켓 폴더 생성과 검사
-// 거부 대상
-// 1. 심볼릭 링크이거나 폴더가 아닌 경로
-// 2. 현재 사용자가 아닌 소유자
-// 3. 그룹이나 다른 사용자 권한
 func ensureDir() error {
 	d := Dir()
 	if err := os.MkdirAll(d, 0o700); err != nil {
@@ -128,27 +194,31 @@ func ensureDir() error {
 	return checkDir(d)
 }
 
+// Refuses
+// 1. A symlink or a path that isn't a folder
+// 2. An owner other than the current user
+// 3. Any group or other permission
 func checkDir(d string) error {
 	fi, err := os.Lstat(d)
 	if err != nil {
 		return err
 	}
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		return fmt.Errorf("세션 폴더가 실제 폴더가 아님: %s", d)
+		return fmt.Errorf("session folder isn't a real folder: %s", d)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok || int(st.Uid) != os.Getuid() {
-		return fmt.Errorf("세션 폴더 소유자가 현재 사용자가 아님: %s", d)
+		return fmt.Errorf("session folder isn't owned by the current user: %s\nremove %s and try again", d, d)
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("세션 폴더 권한이 0700이 아님: %s", d)
+		return fmt.Errorf("session folder permissions aren't 0700: %s", d)
 	}
 	return nil
 }
 
-// 폴더와 소켓 반대편이 모두 현재 사용자 것일 때만 연결
-// 가로챈 폴더나 다른 사용자의 가짜 세션에 쿼리를 보내지 않음
-func Dial(alias string) (*net.UnixConn, error) {
+// Connects only when the folder and the socket peer both belong to the current user
+// so queries never go to a hijacked folder or another user's fake session
+func dial(alias string) (*net.UnixConn, error) {
 	if err := checkDir(Dir()); err != nil {
 		return nil, err
 	}
@@ -158,15 +228,19 @@ func Dial(alias string) (*net.UnixConn, error) {
 	}
 	uc := c.(*net.UnixConn)
 	uid, err := peerUID(uc)
-	if err != nil || uid != os.Getuid() {
+	if err != nil {
 		_ = uc.Close()
-		return nil, fmt.Errorf("%s 세션 소켓의 상대가 현재 사용자가 아님", alias)
+		return nil, fmt.Errorf("%s session socket peer couldn't be checked: %w", alias, err)
+	}
+	if uid != os.Getuid() {
+		_ = uc.Close()
+		return nil, fmt.Errorf("%s session socket peer isn't the current user", alias)
 	}
 	return uc, nil
 }
 
 func Alive(alias string) bool {
-	c, err := Dial(alias)
+	c, err := dial(alias)
 	if err != nil {
 		return false
 	}
@@ -174,9 +248,9 @@ func Alive(alias string) bool {
 	return true
 }
 
-// 세션이 없으면 띄움
-// 같은 별칭을 동시에 띄우지 않도록 잠금 파일에 flock
-// 잠금은 프로세스가 끝나면 커널이 풀어 상태 파일이 아님
+// Starts the session when there's none
+// A flock on the lock file keeps one alias from starting twice at once
+// The kernel releases it when the process ends so it's never stale state
 func Ensure(alias string) (started bool, err error) {
 	if Alive(alias) {
 		return false, nil
@@ -192,14 +266,14 @@ func Ensure(alias string) (started bool, err error) {
 	if Alive(alias) {
 		return false, nil
 	}
-	// 죽은 세션이 남긴 소켓 정리
+	// Clears the socket a dead session left behind
 	if err := os.Remove(SocketPath(alias)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
 	return true, start(alias, startWait)
 }
 
-// 실행 파일 자신을 serve로 띄우고 소켓이 연결을 받을 때까지 대기
+// Runs this executable as serve and waits until its socket accepts connections
 func start(alias string, wait time.Duration) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -212,46 +286,63 @@ func start(alias string, wait time.Duration) error {
 	case err == nil:
 		return nil
 	case errors.As(err, &exit):
-		return fmt.Errorf("%s 세션 시작 실패: %s\n%s\n로그: %s", alias, exit, proc.Tail(path, 5), path)
+		return startError(alias, exit.Error(), path)
 	case errors.Is(err, proc.ErrTimeout):
-		return fmt.Errorf("%s 세션 시작 실패: %s 안에 연결되지 않음\n%s\n로그: %s", alias, wait, proc.Tail(path, 5), path)
+		return startError(alias, fmt.Sprintf("didn't connect within %s", wait), path)
 	}
-	return fmt.Errorf("%s 세션 실행 실패: %w", alias, err)
+	return fmt.Errorf("%s session couldn't run: %w", alias, err)
 }
 
-// shutdown 뒤 wait 안에 소켓이 사라지지 않으면 소켓 반대편 프로세스에 SIGTERM
-// 폴더나 소켓이 없거나 연결이 거부되면 세션이 없어 false
-// 그 밖의 연결 실패는 세션이 남아 있을 수 있어 오류
+func startError(alias, reason, path string) error {
+	return fmt.Errorf("%s session failed to start: %s\n%s", alias, reason, proc.LogTail(path))
+}
+
+// 1. Sends SIGTERM to the socket peer when the socket outlasts wait after shutdown and the peer PID is unchanged
+// 2. A missing folder or socket or a refused connection means no session and returns false
+// 3. Any other connect failure is an error since the session may still be alive
 func Stop(alias string) (bool, error) {
 	return stop(alias, stopWait)
 }
 
 func stop(alias string, wait time.Duration) (bool, error) {
-	c, err := Dial(alias)
+	c, err := dial(alias)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("%s 세션 종료 실패: %w", alias, err)
+		return false, fmt.Errorf("%s session wouldn't stop: %w", alias, err)
 	}
 	pid, _ := peerPID(c)
 	deadline := time.Now().Add(wait)
-	_ = json.NewEncoder(c).Encode(Request{Op: OpShutdown, Alias: alias})
+	_ = json.NewEncoder(c).Encode(Request{Op: opShutdown, Alias: alias})
 	_ = c.SetReadDeadline(deadline)
 	_, _ = io.Copy(io.Discard, c)
 	_ = c.Close()
 	if waitGone(alias, deadline) {
 		return true, nil
 	}
-	if pid > 0 {
+	// The PID is read again so SIGTERM never reaches a new process that reused the PID of an ended session
+	if pid > 0 && peerPIDNow(alias) == pid {
 		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return false, err
+			return false, fmt.Errorf("%s session wouldn't stop: %w", alias, err)
 		}
 	}
 	if !waitGone(alias, time.Now().Add(wait)) {
-		return false, fmt.Errorf("%s 세션 종료 실패", alias)
+		return false, fmt.Errorf("%s session wouldn't stop", alias)
 	}
 	return true, nil
+}
+
+// The socket peer's PID now
+// 0 when the socket no longer accepts
+func peerPIDNow(alias string) int {
+	c, err := dial(alias)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = c.Close() }()
+	pid, _ := peerPID(c)
+	return pid
 }
 
 func waitGone(alias string, deadline time.Time) bool {
@@ -263,39 +354,34 @@ func waitGone(alias string, deadline time.Time) bool {
 	return false
 }
 
-// 요청 하나를 보내고 레코드 줄마다 그 JSON을 넘김
-// ctx가 끝나면 연결을 닫아 세션이 쿼리를 취소
+// Sends one request and passes the JSON of every record line to emit
+// Ending ctx closes the connection so the session cancels the query
+// 1. A failure the session reported comes back with its End
+// 2. A failure on the way comes back with an empty End since no End arrived
 func Query(ctx context.Context, req Request, emit func(line []byte) error) (End, error) {
-	c, err := Dial(req.Alias)
+	c, err := dial(req.Alias)
 	if err != nil {
-		return End{}, fmt.Errorf("%s 세션 연결 실패: %w", req.Alias, err)
+		return End{}, fmt.Errorf("%s couldn't reach the session: %w", req.Alias, err)
 	}
 	defer func() { _ = c.Close() }()
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
 	defer stop()
 	if err := json.NewEncoder(c).Encode(req); err != nil {
-		return End{}, err
+		if ctx.Err() != nil {
+			return End{}, ctx.Err()
+		}
+		return End{}, fmt.Errorf("%s couldn't reach the session: %w", req.Alias, err)
 	}
 	sc := bufio.NewScanner(c)
-	sc.Buffer(make([]byte, 64*1024), maxLine)
+	sc.Buffer(make([]byte, 0, 64<<10), maxLine)
 	for sc.Scan() {
 		line := sc.Bytes()
 		if !bytes.HasPrefix(line, []byte(recordPrefix)) {
-			var end End
-			if err := json.Unmarshal(line, &end); err != nil {
-				return End{}, fmt.Errorf("%s 세션 응답 해석 실패: %w", req.Alias, err)
-			}
-			switch {
-			case end.Outdated:
-				return end, fmt.Errorf("%w: %s", ErrOutdated, end.Error)
-			case end.Error != "":
-				return end, errors.New(end.Error)
-			}
-			return end, nil
+			return parseEnd(req.Alias, line)
 		}
-		// 레코드 줄은 접두어 뒤에 값과 닫는 중괄호가 있어야 함
-		if len(line) <= len(recordPrefix)+1 || line[len(line)-1] != '}' {
-			return End{}, fmt.Errorf("%s 세션 응답 해석 실패: 잘린 레코드 줄", req.Alias)
+		// A cut line can still end in a brace of the record's own value
+		if !json.Valid(line) {
+			return End{}, fmt.Errorf("%s couldn't parse the session's reply: truncated record line", req.Alias)
 		}
 		if err := emit(line[len(recordPrefix) : len(line)-1]); err != nil {
 			return End{}, err
@@ -305,39 +391,61 @@ func Query(ctx context.Context, req Request, emit func(line []byte) error) (End,
 		return End{}, ctx.Err()
 	}
 	if err := sc.Err(); err != nil {
-		return End{}, err
+		return End{}, fmt.Errorf("%s couldn't read the session's reply: %w", req.Alias, err)
 	}
-	return End{}, fmt.Errorf("%s 세션이 응답 중에 끊김", req.Alias)
+	return End{}, fmt.Errorf("%s session dropped mid-response", req.Alias)
 }
 
-// 상주 세션 본체
+func parseEnd(alias string, line []byte) (End, error) {
+	var end End
+	if err := json.Unmarshal(line, &end); err != nil {
+		return End{}, fmt.Errorf("%s couldn't parse the session's reply: %w", alias, err)
+	}
+	switch {
+	case end.Outdated:
+		return end, fmt.Errorf("%w: %s", ErrOutdated, end.Error)
+	case end.Error != "":
+		return end, errors.New(end.Error)
+	}
+	return end, nil
+}
+
 type server struct {
 	alias string
-	// 세션을 띄운 바이너리의 버전
+	// Version of the binary that started the session
 	version  string
 	conn     config.Conn
 	kind     clients.Kind
 	password string
 	ln       *net.UnixListener
 
-	// 단건 조회가 쓰는 연결 하나
-	// 크기 1 채널이 차례를 정하고 client 교체도 차례 안에서만 일어남
+	// The one connection single reads use
+	// The size 1 channel sets the turn and client is only swapped inside a turn
 	turn   chan struct{}
 	client clients.Client
-	// 차례를 기다리는 최대 시간
-	busy time.Duration
+	waits
+	// A slot per running follow
+	follows chan struct{}
 
 	quit     chan struct{}
 	quitOnce sync.Once
 }
 
-// 연결을 먼저 맺은 뒤 소켓을 열어 소켓이 보이면 곧 준비 완료
-// 비밀값은 여기서 한 번만 해석해 재연결과 follow 연결이 재사용
-func Serve(ctx context.Context, alias, version string, conn config.Conn) error {
-	return serve(ctx, alias, version, conn, busyWait)
+// How long the session waits on others
+type waits struct {
+	// For a turn on the held connection
+	busy time.Duration
+	// For the request line after accept
+	request time.Duration
 }
 
-func serve(ctx context.Context, alias, version string, conn config.Conn, busy time.Duration) error {
+// Connects before opening the socket so a visible socket means it's ready
+// The secret is resolved once here and reused by reconnects and follow connections
+func Serve(ctx context.Context, alias, version string, conn config.Conn) error {
+	return serve(ctx, alias, version, conn, waits{busy: busyWait, request: requestWait})
+}
+
+func serve(ctx context.Context, alias, version string, conn config.Conn, w waits) error {
 	kind, err := clients.Get(conn)
 	if err != nil {
 		return err
@@ -351,13 +459,14 @@ func serve(ctx context.Context, alias, version string, conn config.Conn, busy ti
 	}
 	client := kind.New(conn, password)
 	if err := client.Connect(ctx); err != nil {
-		return fmt.Errorf("%s 연결 실패: %w", alias, err)
+		return fmt.Errorf("%s connect failed: %w", alias, err)
 	}
 	s := &server{
 		alias: alias, version: version, conn: conn, kind: kind, password: password, client: client,
-		busy: busy, turn: make(chan struct{}, 1), quit: make(chan struct{}),
+		waits: w, turn: make(chan struct{}, 1), follows: make(chan struct{}, maxFollows), quit: make(chan struct{}),
 	}
 	defer func() { _ = s.client.Close() }()
+	// bind takes no mode so the umask alone keeps the socket file private
 	old := syscall.Umask(0o077)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: SocketPath(alias), Net: "unix"})
 	syscall.Umask(old)
@@ -366,12 +475,12 @@ func serve(ctx context.Context, alias, version string, conn config.Conn, busy ti
 	}
 	ln.SetUnlinkOnClose(true)
 	s.ln = ln
-	fmt.Printf("%s 세션 준비 %s\n", alias, SocketPath(alias))
+	fmt.Printf("%s session ready %s\n", alias, SocketPath(alias))
 	return s.loop(ctx)
 }
 
-// shutdown이나 종료 신호가 오면 진행 중인 요청도 취소해 follow가 세션을 붙잡지 않음
-// Accept가 다른 이유로 실패해도 요청을 먼저 취소한 뒤 기다림
+// A shutdown or a stop signal also cancels running requests so a follow can't hold the session
+// When Accept fails for another reason the requests are still canceled before waiting
 func (s *server) loop(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
 	var wg sync.WaitGroup
@@ -400,11 +509,7 @@ func (s *server) loop(parent context.Context) error {
 			_ = c.Close()
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.handle(ctx, c)
-		}()
+		wg.Go(func() { s.handle(ctx, c) })
 	}
 }
 
@@ -414,35 +519,45 @@ func (s *server) shutdown() {
 
 func (s *server) handle(parent context.Context, c *net.UnixConn) {
 	defer func() { _ = c.Close() }()
-	r := bufio.NewReader(c)
-	line, err := r.ReadBytes('\n')
-	if err != nil {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	// Reads and writes on the connection don't watch ctx
+	// so closing it is what ends a request line still on its way or a write to a sender that stopped reading
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
+	sc := bufio.NewScanner(c)
+	sc.Buffer(make([]byte, 0, 64<<10), maxRequest)
+	// A caller that connects and sends nothing would hold the connection for good
+	_ = c.SetReadDeadline(time.Now().Add(s.request))
+	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			writeEnd(c, End{Error: fmt.Sprintf("%s session couldn't read the request: %s", s.alias, err)})
+		}
 		return
 	}
+	_ = c.SetReadDeadline(time.Time{})
 	var req Request
-	if err := json.Unmarshal(line, &req); err != nil {
-		writeEnd(c, End{Error: "잘못된 요청: " + err.Error()})
+	if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+		writeEnd(c, End{Error: fmt.Sprintf("%s session couldn't parse the request: %s", s.alias, err)})
 		return
 	}
 	if req.Alias != s.alias {
-		writeEnd(c, End{Error: fmt.Sprintf("%s 세션에 %s 요청", s.alias, req.Alias)})
+		writeEnd(c, End{Error: fmt.Sprintf("%s session got a request for %s", s.alias, req.Alias)})
 		return
 	}
-	// 다른 버전의 바이너리도 이전 세션을 멈출 수 있게 버전보다 먼저 처리
-	if req.Op == OpShutdown {
+	// Handled before the version check so a binary of another version can stop an old session
+	if req.Op == opShutdown {
 		writeEnd(c, End{})
 		s.shutdown()
 		return
 	}
 	if req.Version != s.version {
-		writeEnd(c, End{Error: fmt.Sprintf("%s 세션 버전 %s와 요청 버전 %s가 다름", s.alias, s.version, req.Version), Outdated: true})
+		writeEnd(c, End{Error: fmt.Sprintf("%s session version %s differs from request version %s", s.alias, s.version, req.Version), Outdated: true})
 		return
 	}
-	// 요청을 보낸 쪽이 연결을 닫으면 쿼리 취소
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
+	// The query is canceled when the sender closes the connection
 	go func() {
-		_, _ = io.Copy(io.Discard, r)
+		_, _ = io.Copy(io.Discard, c)
 		cancel()
 	}()
 	w := bufio.NewWriter(c)
@@ -450,76 +565,125 @@ func (s *server) handle(parent context.Context, c *net.UnixConn) {
 	emit := func(rec record.Record) error {
 		_, _ = w.WriteString(recordPrefix)
 		_, _ = w.Write(rec.JSON())
-		_, _ = w.WriteString("}\n")
+		// A bufio Writer keeps its first error so the last write reports a failure of any of them
+		if _, err := w.WriteString("}\n"); err != nil {
+			return err
+		}
 		rows++
-		// follow는 레코드가 드물어 바로 내보내고 단건 조회는 버퍼가 찰 때만
+		// Follow records are sparse so each one flushes at once
+		// A single read flushes only when the buffer fills
 		if req.Follow {
 			return w.Flush()
 		}
 		return nil
 	}
-	end := End{}
-	q := clients.Query{Text: req.Query, Write: req.Write, Limit: req.Limit}
-	if err := req.check(); err != nil {
-		end.Error = err.Error()
-	} else if err := s.kind.Check(q.Text, q.Write); err != nil {
-		end.Error = err.Error()
-	} else if req.Follow {
-		end.Error = errText(ctx, s.follow(ctx, q, clients.Watching{Interval: req.Interval, Key: req.Key}, emit))
-	} else {
-		reconnected, err := s.read(ctx, q, emit)
-		end.Reconnected = reconnected
-		end.Error = errText(ctx, err)
+	end, err := s.runQuery(ctx, req, emit)
+	// A sender that left reads nothing and a stopping session drops its requests
+	if ctx.Err() != nil {
+		return
 	}
 	end.Rows = rows
-	if ctx.Err() == nil {
-		_ = w.Flush()
-		writeEnd(c, end)
+	if err != nil {
+		end.Error = err.Error()
 	}
+	writeEnd(w, end)
+	_ = w.Flush()
 }
 
-func errText(ctx context.Context, err error) string {
-	if err == nil || ctx.Err() != nil {
-		return ""
+// Reaching --max is a normal end with Spent set
+func (s *server) runQuery(ctx context.Context, req Request, emit clients.Emit) (End, error) {
+	if err := req.check(); err != nil {
+		return End{}, err
 	}
-	return err.Error()
+	if err := s.kind.Check(req.Query, req.Write); err != nil {
+		return End{}, err
+	}
+	q, m := req.query()
+	var end End
+	var err error
+	if req.Follow {
+		err = s.follow(ctx, q, clients.Watching{Interval: req.Interval, Key: req.Key}, emit)
+	} else {
+		end.Reconnected, err = s.read(ctx, q, emit)
+	}
+	if m != nil {
+		end.Used = m.used
+	}
+	if errors.Is(err, clients.ErrBudget) {
+		end.Spent, err = true, nil
+	}
+	return end, err
 }
 
-// 단건 조회는 쥔 연결을 차례로 사용
-// 끊긴 연결은 다시 맺고 한 번 재시도
-// 다시 맺기에 실패하면 이전 클라이언트를 그대로 두어 다음 요청이 다시 시도
+// 1. Single reads take turns on the held connection
+// 2. A dropped connection is reopened and the read retried once
+// 3. A failed reconnect keeps the old client so the next request tries again
 func (s *server) read(ctx context.Context, q clients.Query, emit clients.Emit) (bool, error) {
 	select {
 	case s.turn <- struct{}{}:
 	case <-ctx.Done():
 		return false, ctx.Err()
 	case <-time.After(s.busy):
-		return false, fmt.Errorf("%s 세션 사용 중", s.alias)
+		return false, fmt.Errorf("%s session busy\nanother read still holds the connection", s.alias)
 	}
 	defer func() { <-s.turn }()
-	err := s.client.Read(ctx, q, emit)
+	err := clients.Run(ctx, s.client, q, emit)
 	if !errors.Is(err, clients.ErrDisconnected) {
+		return false, err
+	}
+	if err := s.checkPort(); err != nil {
 		return false, err
 	}
 	fresh := s.kind.New(s.conn, s.password)
 	if err := fresh.Connect(ctx); err != nil {
-		return false, fmt.Errorf("%s 재연결 실패: %w", s.alias, err)
+		return false, fmt.Errorf("%s reconnect failed: %w", s.alias, err)
 	}
 	_ = s.client.Close()
 	s.client = fresh
-	return true, s.client.Read(ctx, q, emit)
+	err = clients.Run(ctx, s.client, q, emit)
+	if errors.Is(err, clients.ErrDisconnected) {
+		return true, fmt.Errorf("%s connection dropped again after reconnecting", s.alias)
+	}
+	return true, err
 }
 
-// follow는 수명 동안 자기 연결을 따로 써 단건 조회를 막지 않음
+// A follow uses its own connection for its lifetime so it never blocks single reads
+// Follows are capped since each one holds a source connection and a poll loop
 func (s *server) follow(ctx context.Context, q clients.Query, w clients.Watching, emit clients.Emit) error {
+	select {
+	case s.follows <- struct{}{}:
+	default:
+		return fmt.Errorf("%s session already runs %d follows", s.alias, maxFollows)
+	}
+	defer func() { <-s.follows }()
+	if err := s.checkPort(); err != nil {
+		return err
+	}
 	c := s.kind.New(s.conn, s.password)
 	if err := c.Connect(ctx); err != nil {
-		return err
+		return fmt.Errorf("%s follow connect failed: %w", s.alias, err)
 	}
 	defer func() { _ = c.Close() }()
 	return clients.Watch(ctx, c, q, w, emit)
 }
 
-func writeEnd(c net.Conn, end End) {
-	_ = json.NewEncoder(c).Encode(end)
+// Swapped in tests to act as another user
+var checkOwner = proc.CheckOwner
+
+// A tunnel port another user bound after the tunnel dropped must not get the password
+// A closed port is left to Connect so its failure keeps the plain cause
+func (s *server) checkPort() error {
+	if s.conn.Tunnel == nil {
+		return nil
+	}
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(s.conn.Host, strconv.Itoa(s.conn.Port)), dialWait)
+	if err != nil {
+		return nil
+	}
+	_ = c.Close()
+	return checkOwner(s.alias, s.conn.Port)
+}
+
+func writeEnd(w io.Writer, end End) {
+	_ = json.NewEncoder(w).Encode(end)
 }
