@@ -37,7 +37,7 @@ type command struct {
 
 func commands() map[string]command {
 	return map[string]command{
-		"ls":    {usage: "ls", help: "list connections with their tunnel and session state", run: (*app).ls},
+		"ls":    {usage: "ls [--json]", help: "list connections with their tunnel and session state", run: (*app).ls},
 		"open":  {usage: "open <alias>", help: "open the tunnel and start the session", run: (*app).open},
 		"close": {usage: "close <alias|all>", help: "stop the session and close tunnels gatereach opened", run: (*app).close},
 		"q": {
@@ -45,7 +45,7 @@ func commands() map[string]command {
 			help:  "print one JSON line per record or save to the --out folder\nopens closed tunnels and sessions and keeps them up",
 			run:   (*app).query,
 		},
-		"discover": {usage: "discover " + strings.Join(tunnels.Names(), "|"), help: "list targets the tunnel can reach", run: (*app).discover},
+		"discover": {usage: "discover " + strings.Join(tunnels.Names(), "|") + " [--json]", help: "list targets the tunnel can reach", run: (*app).discover},
 		"add":      {usage: "add <alias> --client " + strings.Join(clients.Names(), "|") + " [options]", help: "add a connection to the config file", run: (*app).add},
 		"serve":    {usage: "serve <alias>", run: (*app).serve, hidden: true},
 	}

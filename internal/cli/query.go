@@ -43,6 +43,7 @@ type queryOptions struct {
 	out      string
 	format   string
 	follow   bool
+	events   bool
 	interval time.Duration
 	key      string
 	// Parsed only once the alias gives the source's unit
@@ -63,6 +64,7 @@ func (a *app) parseQuery(args []string) (queryOptions, error) {
 	fs.StringVar(&o.out, "out", "", "save results as a Data Package folder")
 	fs.StringVar(&o.format, "format", "arrow", "data file format for --out: "+strings.Join(sinks.FormatNames(), " or "))
 	fs.BoolVar(&o.follow, "follow", false, "keep printing new records until stopped")
+	fs.BoolVar(&o.events, "events", false, "wrap records and the final outcome as versioned JSONL events")
 	interval := fs.Float64("interval", defaultInterval.Seconds(), "seconds between polls with --follow")
 	fs.StringVar(&o.key, "key", "", "field that tells polled records apart\nthe whole record when left out")
 	fs.StringVar(&o.max, "max", "",
@@ -83,6 +85,9 @@ func (a *app) parseQuery(args []string) (queryOptions, error) {
 		o.alias, o.text = pos[0], pos[1]
 	default:
 		return o, usageError("q")
+	}
+	if o.events && o.out != "" {
+		return o, errors.New("--events cannot be combined with --out")
 	}
 	if o.limit < 1 {
 		return o, errors.New("--limit must be at least 1")
@@ -154,8 +159,33 @@ func (a *app) query(args []string) error {
 	if err != nil {
 		return err
 	}
-	interrupted, err := a.runQuery(o)
-	return exitFor(o.follow, interrupted, err)
+	r := queryReport{Schema: "gatereach/v1", Type: "end", Version: version.Version, Alias: o.alias,
+		Limit: o.limit, Follow: o.follow, Status: "finished"}
+	interrupted, err := a.runQuery(o, &r)
+	err = exitFor(o.follow, interrupted, err)
+	switch {
+	case interrupted && err == nil:
+		r.Status = "stopped"
+	case interrupted && errors.As(err, new(exitCode)):
+		r.Status = "interrupted"
+	case err != nil:
+		r.Status = "error"
+	case r.Session != nil && r.Session.Spent:
+		r.Status = "budget"
+	}
+	if err != nil {
+		r.Error = err.Error()
+	}
+	if o.events {
+		if writeErr := writeJSON(a.stdout, r); writeErr != nil {
+			var code exitCode
+			if errors.As(err, &code) {
+				return writeErr
+			}
+			return joinErrors(err, writeErr)
+		}
+	}
+	return err
 }
 
 // 1. A follow stopped by a signal exits cleanly
@@ -174,7 +204,7 @@ func exitFor(follow, interrupted bool, err error) error {
 // The session owns the source and the Sink owns the output
 // Only this function joins the two
 // The write rules are checked before any tunnel or session opens
-func (a *app) runQuery(o queryOptions) (bool, error) {
+func (a *app) runQuery(o queryOptions, report *queryReport) (bool, error) {
 	c, err := a.conn(o.alias)
 	if err != nil {
 		return false, err
@@ -197,6 +227,9 @@ func (a *app) runQuery(o queryOptions) (bool, error) {
 	maxAmount, err := parseMax(c.Client, kind.Budget, o.max)
 	if err != nil {
 		return false, err
+	}
+	if maxAmount > 0 {
+		report.Budget = &queryBudget{Max: maxAmount, Unit: kind.Budget.Unit}
 	}
 	if err := sinks.CheckFolder(o.out); err != nil {
 		return false, err
@@ -229,7 +262,20 @@ func (a *app) runQuery(o queryOptions) (bool, error) {
 		Version: version.Version, Alias: o.alias, Query: o.text, Write: o.write,
 		Limit: o.limit, Follow: o.follow, Interval: o.interval, Key: o.key, Max: maxAmount, Timeout: o.timeout,
 	}
-	end, runErr := a.send(ctx, req, writer(sink))
+	emit := writer(sink)
+	end, runErr := a.send(ctx, req, func(line []byte) error {
+		if o.events {
+			line = append(append([]byte(`{"schema":"gatereach/v1","type":"record","record":`), line...), '}')
+		}
+		if err := emit(line); err != nil {
+			return err
+		}
+		report.Rows++
+		return nil
+	})
+	if runErr == nil || end.Error != "" {
+		report.Session = &end
+	}
 	// Interrupted only when the cancel ended the run
 	// 1. A signal after a finished run leaves its result as is
 	// 2. An error the session sent stays a run error

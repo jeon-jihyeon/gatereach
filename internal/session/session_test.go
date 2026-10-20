@@ -461,16 +461,18 @@ func TestStopEndsASessionWithAFollow(t *testing.T) {
 // as a pager that quit leaves it
 func TestStopEndsASessionStuckWriting(t *testing.T) {
 	ended := make(chan struct{})
+	wrote := make(chan error, 1)
 	held := mocks.NewMockClient(gomock.NewController(t))
 	held.EXPECT().Connect(gomock.Any()).Return(nil)
 	held.EXPECT().Close().DoAndReturn(func() error {
 		close(ended)
 		return nil
 	})
-	big := strings.Repeat("x", 64<<10)
+	big := strings.Repeat("x", 1<<20)
 	reads(held).DoAndReturn(func(_ context.Context, _ clients.Query, emit clients.Emit) error {
 		for {
 			if err := emit(record.New([]string{"x"}, []any{big})); err != nil {
+				wrote <- err
 				return err
 			}
 		}
@@ -480,11 +482,23 @@ func TestStopEndsASessionStuckWriting(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	require.NoError(t, json.NewEncoder(c).Encode(Request{Version: testVersion, Alias: testAlias, Query: "x", Limit: 1}))
+	// Request delivery alone does not establish that Read reached the socket write
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	prefix := make([]byte, len(recordPrefix))
+	_, err = io.ReadFull(c, prefix)
+	require.NoError(t, err)
+	require.Equal(t, recordPrefix, string(prefix))
+	select {
+	case err := <-wrote:
+		t.Fatalf("write ended before shutdown: %v", err)
+	default:
+	}
 	stopped, err := Stop(testAlias)
 	require.NoError(t, err)
 	assert.True(t, stopped)
 	select {
 	case <-ended:
+		assert.Error(t, <-wrote)
 	case <-time.After(2 * time.Second):
 		t.Fatal("the session kept waiting on its write")
 	}
