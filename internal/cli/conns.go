@@ -22,7 +22,17 @@ var tunnelMessages = map[tunnels.Result]string{
 	tunnels.Opened:  "opened",
 }
 
-func (a *app) ls([]string) error {
+func (a *app) ls(args []string) error {
+	fs := newFlags("ls", a.stderr)
+	asJSON := fs.Bool("json", false, "print versioned connection JSON")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 0 {
+		return usageError("ls")
+	}
+	rows := make([]connectionInfo, 0, len(a.cfg.Aliases))
 	for _, alias := range a.cfg.Aliases {
 		c := a.cfg.Conns[alias]
 		state := "-"
@@ -36,7 +46,7 @@ func (a *app) ls([]string) error {
 		if c.Port != 0 {
 			where = fmt.Sprintf("%s:%d", c.Host, c.Port)
 		}
-		tunnel := "-"
+		tunnel := ""
 		if c.Tunnel != nil {
 			tunnel = c.Tunnel.Type
 		}
@@ -44,8 +54,20 @@ func (a *app) ls([]string) error {
 		if session.Alive(alias) {
 			live = "live"
 		}
+		if *asJSON {
+			rows = append(rows, connectionInfo{Alias: alias, Client: c.Client, Host: c.Host, Port: c.Port,
+				Profile: c.Profile, User: c.User, Tunnel: tunnel,
+				PortState: state, SessionAlive: live == "live"})
+			continue
+		}
 		fmt.Fprintf(a.stdout, "%-24s %-8s %-22s %-10s %-5s %-6s %s\n",
-			clean(alias), clean(or(c.Client, "?")), clean(or(where, "-")), clean(or(c.User, "-")), clean(tunnel), state, live)
+			clean(alias), clean(or(c.Client, "?")), clean(or(where, "-")), clean(or(c.User, "-")), clean(or(tunnel, "-")), state, live)
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, struct {
+			Schema      string           `json:"schema"`
+			Connections []connectionInfo `json:"connections"`
+		}{"gatereach/v1", rows})
 	}
 	return nil
 }
@@ -136,10 +158,16 @@ func (a *app) close(args []string) error {
 }
 
 func (a *app) discover(args []string) error {
-	if len(args) != 1 {
+	fs := newFlags("discover", a.stderr)
+	asJSON := fs.Bool("json", false, "print versioned target JSON")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
 		return usageError("discover")
 	}
-	kind, err := tunnels.Of(a.cfg, args[0])
+	kind, err := tunnels.Of(a.cfg, pos[0])
 	if err != nil {
 		return err
 	}
@@ -153,13 +181,25 @@ func (a *app) discover(args []string) error {
 	if err != nil {
 		return err
 	}
+	rows := make([]targetInfo, 0, len(targets))
 	for _, t := range targets {
 		mark := "new"
 		if known[t.Target] {
 			mark = "added"
 		}
+		if *asJSON {
+			users := append([]string{}, t.Users...)
+			rows = append(rows, targetInfo{t.Name, t.Client, users, t.Target, known[t.Target]})
+			continue
+		}
 		fmt.Fprintf(a.stdout, "%-6s %-28s %-6s %-16s %s\n",
 			mark, clean(t.Name), clean(or(t.Client, "-")), clean(strings.Join(t.Users, ",")), clean(t.Target))
+	}
+	if *asJSON {
+		return writeJSON(a.stdout, struct {
+			Schema  string       `json:"schema"`
+			Targets []targetInfo `json:"targets"`
+		}{"gatereach/v1", rows})
 	}
 	return nil
 }

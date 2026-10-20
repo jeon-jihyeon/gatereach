@@ -1,6 +1,6 @@
 {
   "name": "gatereach",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Query MySQL, Redis, DynamoDB, Kafka and Athena behind tunnels or credentials through saved aliases, read only by default, as JSON lines or a Data Package",
   "author": {
     "name": "jeon-jihyeon"

@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -137,6 +139,27 @@ func TestClean(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, tc.want, clean(tc.in))
+		})
+	}
+}
+
+func TestWriteJSONUnsupported(t *testing.T) {
+	t.Parallel()
+	tcs := []struct {
+		name  string
+		value any
+	}{
+		{"channel", make(chan int)},
+		{"function", func() {}},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			err := writeJSON(&out, tc.value)
+			var unsupported *json.UnsupportedTypeError
+			assert.ErrorAs(t, err, &unsupported)
+			assert.Empty(t, out.String())
 		})
 	}
 }

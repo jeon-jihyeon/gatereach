@@ -2,6 +2,12 @@
 
 All notable changes to gatereach are listed here. Versions follow [Semantic Versioning](https://semver.org/), and while the major version is 0, a minor release may change behavior.
 
+## 0.2.1
+
+### Fixed
+
+- Optional versioned JSON output exposes connection discovery and query outcomes without parsing human messages
+
 ## 0.2.0 - 2026-10-17
 
 ### Added

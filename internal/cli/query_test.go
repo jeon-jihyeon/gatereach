@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/jeon-jihyeon/gatereach/internal/version"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -95,6 +96,35 @@ func TestQuery_Errors(t *testing.T) {
 			code, _, errw := run(tc.args...)
 			assert.Equal(t, tc.want.code, code)
 			assert.Contains(t, errw, tc.want.err)
+		})
+	}
+}
+
+func TestQueryEventsPreflight(t *testing.T) {
+	useConfig(t, "")
+	type want struct {
+		code    int
+		out     string
+		message string
+	}
+	tcs := []struct {
+		name string
+		args []string
+		want want
+	}{
+		{"unknown alias", []string{"q", "missing", "GET k", "--events"},
+			want{1, `{"schema":"gatereach/v1","type":"end","version":"` + version.Version + `",` +
+				`"alias":"missing","limit":1000,"follow":false,"rows":0,"status":"error",` +
+				`"error":"unknown alias: missing\navailable: none"}` + "\n", "unknown alias"}},
+		{"incompatible outputs", []string{"q", "missing", "GET k", "--events", "--out", t.TempDir()},
+			want{1, "", "--events cannot be combined with --out"}},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out, errw := run(tc.args...)
+			assert.Equal(t, tc.want.code, code)
+			assert.Equal(t, tc.want.out, out)
+			assert.Contains(t, errw, tc.want.message)
 		})
 	}
 }

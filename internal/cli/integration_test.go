@@ -4,7 +4,9 @@ package cli_test
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeon-jihyeon/gatereach/internal/cli"
 	"github.com/jeon-jihyeon/gatereach/internal/session"
 )
 
@@ -84,6 +87,24 @@ func TestSessionLifecycleAgainstRedis(t *testing.T) {
 	assert.NotContains(t, errw, "session started", "the session is reused")
 	assert.Equal(t, "{\"value\":\"v\"}\n", out)
 
+	code, _, errw = gr("q", "r", "SET large 9223372036854775805", "--write")
+	require.Equal(t, 0, code, errw)
+	code, out, errw = gr("q", "r", "INCR large", "--write", "--events")
+	require.Equal(t, 0, code, errw)
+	assert.Contains(t, out, `"record":{"value":9223372036854775806}`)
+	code, out, errw = gr("q", "r", "GET absent", "--events")
+	require.Equal(t, 0, code, errw)
+	assert.Contains(t, out, `"record":{"value":null}`)
+
+	code, _, errw = gr("q", "r", "SET payload "+strings.Repeat("x", 100<<10), "--write")
+	require.Equal(t, 0, code, errw)
+	closed, broken := io.Pipe()
+	require.NoError(t, closed.Close())
+	var failure strings.Builder
+	assert.Equal(t, 1, cli.Run([]string{"q", "r", "GET payload", "--events"}, broken, &failure))
+	assert.Equal(t, 1, strings.Count(failure.String(), io.ErrClosedPipe.Error()))
+	require.NoError(t, broken.Close())
+
 	// The next q replaces a session an older binary started with its own binary
 	old := filepath.Join(dir, "gatereach-old")
 	build = exec.Command(
@@ -118,10 +139,42 @@ func TestSessionLifecycleAgainstRedis(t *testing.T) {
 	assert.Equal(t, "{\"value\":\"v\"}\n", out)
 	assert.True(t, strings.HasSuffix(errw, "r stopped at --max: read 2 reply elements of 2 reply elements\n"), errw)
 
+	type outcome struct {
+		Status  string `json:"status"`
+		Session struct {
+			Rows  int  `json:"rows"`
+			Spent bool `json:"spent"`
+		} `json:"session"`
+	}
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		status string
+		spent  bool
+	}{
+		{"finished", []string{"q", "r", "GET k", "--events"}, "finished", false},
+		{"budget", []string{"q", "r", "GET k", "--events", "--max", "1"}, "budget", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out, errw := gr(tc.args...)
+			require.Equal(t, 0, code, errw)
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			require.Len(t, lines, 2)
+			assert.JSONEq(t, `{"schema":"gatereach/v1","type":"record","record":{"value":"v"}}`, lines[0])
+			var end outcome
+			require.NoError(t, json.Unmarshal([]byte(lines[1]), &end))
+			assert.Equal(t, tc.status, end.Status)
+			assert.Equal(t, tc.spent, end.Session.Spent)
+			assert.Equal(t, 1, end.Session.Rows)
+		})
+	}
+
 	// A blocking command past --timeout fails with the timeout and the session keeps serving
-	code, _, errw = gr("q", "r", "BLPOP missing 10", "--write", "--timeout", "0.2")
+	code, out, errw = gr("q", "r", "BLPOP missing 10", "--write", "--timeout", "0.2", "--events")
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errw, "query ran past --timeout 200ms")
+	assert.Contains(t, out, `"status":"error"`)
+	assert.Contains(t, out, `"session":`)
 	code, _, errw = gr("q", "r", "GET k")
 	require.Equal(t, 0, code, errw)
 
@@ -131,18 +184,25 @@ func TestSessionLifecycleAgainstRedis(t *testing.T) {
 	assert.Contains(t, out, "r session already running")
 
 	// An interrupted follow exits cleanly
-	follow := exec.Command(bin, "q", "r", "GET k", "--follow", "--interval", "1")
+	follow := exec.Command(bin, "q", "r", "GET k", "--follow", "--interval", "1", "--events")
 	stdout, err := follow.StdoutPipe()
 	require.NoError(t, err)
 	require.NoError(t, follow.Start())
-	line, err := bufio.NewReader(stdout).ReadString('\n')
+	reader := bufio.NewReader(stdout)
+	line, err := reader.ReadString('\n')
 	require.NoError(t, err)
-	assert.Equal(t, "{\"value\":\"v\"}\n", line)
+	assert.JSONEq(t, `{"schema":"gatereach/v1","type":"record","record":{"value":"v"}}`, line)
 	require.NoError(t, follow.Process.Signal(syscall.SIGINT))
+	line, err = reader.ReadString(10)
+	require.NoError(t, err)
+	assert.Contains(t, line, `"status":"stopped"`)
+	assert.NotContains(t, line, `"session":`)
 	assert.NoError(t, follow.Wait())
 
 	// An interrupted single read exits 130
-	block := exec.Command(bin, "q", "r", "BLPOP missing 10", "--write")
+	block := exec.Command(bin, "q", "r", "BLPOP missing 10", "--write", "--events")
+	var blockOutput strings.Builder
+	block.Stdout = &blockOutput
 	require.NoError(t, block.Start())
 	time.Sleep(300 * time.Millisecond)
 	require.NoError(t, block.Process.Signal(syscall.SIGINT))
@@ -150,6 +210,8 @@ func TestSessionLifecycleAgainstRedis(t *testing.T) {
 	var ee *exec.ExitError
 	require.ErrorAs(t, err, &ee)
 	assert.Equal(t, 130, ee.ExitCode())
+	assert.Contains(t, blockOutput.String(), `"status":"interrupted"`)
+	assert.NotContains(t, blockOutput.String(), `"session":`)
 
 	code, out, _ = gr("close", "r")
 	assert.Equal(t, 0, code)
