@@ -2,7 +2,7 @@
 
 All notable changes to gatereach are listed here. Versions follow [Semantic Versioning](https://semver.org/), and while the major version is 0, a minor release may change behavior.
 
-## 0.2.1
+## 0.2.1 - 2026-10-21
 
 ### Fixed
 
