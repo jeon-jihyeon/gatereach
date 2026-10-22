@@ -2,6 +2,14 @@
 
 All notable changes to gatereach are listed here. Versions follow [Semantic Versioning](https://semver.org/), and while the major version is 0, a minor release may change behavior.
 
+## 0.2.2 - 2026-10-22
+
+### Fixed
+
+- An `--out` package records the `--max` cap as `max` and `unit`, and a run that stopped at the cap as `"stopped": "budget"` next to `"complete": true`
+- The `gatereach` object in `datapackage.json` puts `complete` and `error` right after `version` and the query last, so a long query never hides the outcome
+- A cap that isn't finite or has no unit is refused before the output folder is made
+
 ## 0.2.1 - 2026-10-21
 
 ### Fixed

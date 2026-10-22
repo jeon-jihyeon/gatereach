@@ -120,7 +120,7 @@ Queries:
 - `redis error reply`: the server's own error follows. Fix the command
 - `no such kafka topic: <name>` or `kafka topic <name> lookup failed`: check the name with the `topics` query
 - `interrupted`: a query without `--follow` was stopped and exited 130. What arrived is partial
-- `<alias> stopped at --max`: the source read what `--max` allowed. What printed is complete for the work it paid for but may not be the whole answer. Narrow the query, or ask the user before raising `--max`
+- `<alias> stopped at --max`: the source read what `--max` allowed. What printed is complete for the work it paid for but may not be the whole answer. An `--out` package records it as `"stopped": "budget"` next to `"complete": true`, with the cap as `max` and `unit`. Narrow the query, or ask the user before raising `--max`
 - `<client> --max takes <unit>, such as <example>`: the amount isn't in that source's form. Write it like the example
 - `query ran past --timeout <duration>`: the run took longer than `--timeout` and was stopped. Narrow the query, or ask the user before raising the timeout
 - `mysql --max needs performance_schema statement history`, sometimes followed by `no statement recorded for this connection`: the server can't report rows examined, because it's older than MySQL 8.0.16, the history is off or the account can't read it. Run without `--max` only if the user agrees, and tell them why
