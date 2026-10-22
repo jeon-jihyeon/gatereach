@@ -252,7 +252,8 @@ func (a *app) runQuery(o queryOptions, report *queryReport) (bool, error) {
 	defer stop()
 	meta := sinks.Meta{
 		Version: version.Version, Alias: o.alias, Client: c.Client, User: c.User,
-		Query: o.text, Limit: o.limit, Write: o.write, Follow: o.follow, Started: time.Now(),
+		Query: o.text, Limit: o.limit, Max: maxAmount, Unit: kind.Budget.Unit, Write: o.write, Follow: o.follow,
+		Started: time.Now(),
 	}
 	sink, err := sinks.Get(o.out, o.format, meta, a.stdout, a.stderr)
 	if err != nil {
@@ -290,7 +291,11 @@ func (a *app) runQuery(o queryOptions, report *queryReport) (bool, error) {
 	if end.Reconnected {
 		fmt.Fprintf(a.stderr, "%s reconnected after a drop\nsession variables and temporary tables were reset\n", name)
 	}
-	closeErr := sink.Close(runErr)
+	var stopped sinks.Stop
+	if end.Spent {
+		stopped = sinks.StopBudget
+	}
+	closeErr := sink.Close(stopped, runErr)
 	// Only an End the session sent carries a total
 	// 1. An interrupt or a broken connection leaves none
 	// 2. Every failure the session sent has its error text

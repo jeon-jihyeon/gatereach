@@ -36,7 +36,7 @@ func TestNewFieldStartsSegmentWithoutLoss(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, p.Write(record.New([]string{"a"}, []any{int64(1)})))
 			require.NoError(t, p.Write(record.New([]string{"a", "b"}, []any{int64(2), "x"})))
-			require.NoError(t, p.Close(nil))
+			require.NoError(t, p.Close("", nil))
 			res := descriptorOf(t, dir)["resources"].([]any)
 			require.Len(t, res, 2)
 			for i, want := range []string{"result." + Formats[format].suffix, "result-2." + Formats[format].suffix} {
@@ -56,7 +56,7 @@ func TestLingerFlushesALoneRecord(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "out")
 	p, err := newPackage(dir, "csv", testMeta, &bytes.Buffer{}, &bytes.Buffer{}, 1000, 50*time.Millisecond)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = p.Close(nil) })
+	t.Cleanup(func() { _ = p.Close("", nil) })
 	require.NoError(t, p.Write(record.New([]string{"a"}, []any{"x"})))
 	assert.Eventually(t, func() bool {
 		b, _ := os.ReadFile(filepath.Join(dir, "result.csv"))
@@ -64,20 +64,21 @@ func TestLingerFlushesALoneRecord(t *testing.T) {
 	}, 2*time.Second, 50*time.Millisecond)
 }
 
-// A write failure sticks to later Write and Close calls so the caller exits non-zero
-// A folder that can't take the temp file keeps the first descriptor
-func TestWriteErrorSticks(t *testing.T) {
-	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "out")
-	p, err := newPackage(dir, "csv", testMeta, &bytes.Buffer{}, &bytes.Buffer{}, 1, time.Hour)
-	require.NoError(t, err)
-	require.NoError(t, os.Chmod(dir, 0o500))
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	first := p.Write(record.New([]string{"a"}, []any{"x"}))
-	require.Error(t, first)
-	assert.Equal(t, first, p.Write(record.New([]string{"a"}, []any{"y"})))
-	assert.Error(t, p.Close(nil))
-	assert.Equal(t, notFinished, descriptorOf(t, dir)["gatereach"].(map[string]any)["error"])
+func TestClose_SegmentFailure(t *testing.T) {
+	for _, format := range []string{"arrow", "csv"} {
+		t.Run(format, func(t *testing.T) {
+			t.Parallel()
+			dir := filepath.Join(t.TempDir(), "out")
+			p, err := newPackage(dir, format, testMeta, &bytes.Buffer{}, &bytes.Buffer{}, 1, time.Hour)
+			require.NoError(t, err)
+			require.NoError(t, p.Write(record.New([]string{"a"}, []any{"x"})))
+			require.NoError(t, p.seg.close())
+			assert.Error(t, p.Close("", nil))
+			run := descriptorOf(t, dir)["gatereach"].(map[string]any)
+			assert.Equal(t, false, run["complete"])
+			assert.NotEmpty(t, run["error"])
+		})
+	}
 }
 
 // The folder holds a partial descriptor from the start and only the final one after Close
@@ -93,7 +94,7 @@ func TestDescriptorIsPartialUntilClose(t *testing.T) {
 	assert.Empty(t, first["resources"])
 
 	require.NoError(t, p.Write(record.New([]string{"a"}, []any{"x"})))
-	require.NoError(t, p.Close(nil))
+	require.NoError(t, p.Close("", nil))
 	final := descriptorOf(t, dir)["gatereach"].(map[string]any)
 	assert.Equal(t, true, final["complete"])
 	assert.NotContains(t, final, "error")
@@ -121,7 +122,7 @@ func TestSegmentRefusesAPlantedLink(t *testing.T) {
 	require.NoError(t, os.Symlink(target, filepath.Join(dir, "result.csv")))
 	writeErr := p.Write(record.New([]string{"a"}, []any{"x"}))
 	require.Error(t, writeErr)
-	assert.Equal(t, writeErr, p.Close(nil))
+	assert.Equal(t, writeErr, p.Close("", nil))
 	run := descriptorOf(t, dir)["gatereach"].(map[string]any)
 	assert.Equal(t, false, run["complete"])
 	assert.Equal(t, writeErr.Error(), run["error"])

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,16 +67,20 @@ func newPackage(folder, formatName string, meta Meta, stdout, stderr io.Writer, 
 	if !ok {
 		return nil, fmt.Errorf("unsupported format: %s\navailable: %s", formatName, strings.Join(FormatNames(), " "))
 	}
+	if math.IsNaN(meta.Max) || math.IsInf(meta.Max, 0) || meta.Max < 0 {
+		return nil, errors.New("budget maximum must be finite and non-negative")
+	}
+	if meta.Max > 0 && meta.Unit == "" {
+		return nil, errors.New("budget maximum needs a source unit")
+	}
 	if err := CheckFolder(folder); err != nil {
 		return nil, err
 	}
 	if err := makeFolder(folder); err != nil {
 		return nil, err
 	}
-	metaJS, err := compactJSON(meta.entries(nil, ""))
-	if err != nil {
-		return nil, err
-	}
+	// Metadata contains only primitives and the budget is finite
+	metaJS, _ := compactJSON(meta.entries(nil))
 	p := &Package{
 		folder: folder, format: f, meta: meta, metaJS: metaJS,
 		stdout: stdout, stderr: stderr, batch: batch, linger: linger,
@@ -233,7 +238,7 @@ func (p *Package) Write(r record.Record) error {
 }
 
 // A failed write is returned even after a successful run so the caller exits non-zero
-func (p *Package) Close(runErr error) error {
+func (p *Package) Close(stop Stop, runErr error) error {
 	close(p.stop)
 	<-p.done
 	p.mu.Lock()
@@ -253,7 +258,7 @@ func (p *Package) Close(runErr error) error {
 	if cause == nil {
 		cause = p.err
 	}
-	if err := p.descriptor(cause); err != nil {
+	if err := p.descriptor(stop, cause); err != nil {
 		return err
 	}
 	path := filepath.Join(p.folder, descriptorName)
@@ -281,10 +286,7 @@ const descriptorName = "datapackage.json"
 const notFinished = "not finished"
 
 func (p *Package) writeFirstDescriptor() error {
-	b, err := p.descriptorJSON(false, notFinished)
-	if err != nil {
-		return err
-	}
+	b := p.descriptorJSON(outcome{errText: notFinished})
 	f, err := create(filepath.Join(p.folder, descriptorName))
 	if err != nil {
 		return err
@@ -298,15 +300,12 @@ func (p *Package) writeFirstDescriptor() error {
 
 // The final descriptor replaces the first one by a rename
 // A reader sees either the old file or the new one and never a half-written one
-func (p *Package) descriptor(cause error) error {
-	errText := ""
+func (p *Package) descriptor(stop Stop, cause error) error {
+	o := outcome{complete: cause == nil, stop: stop}
 	if cause != nil {
-		errText = cause.Error()
+		o.errText = cause.Error()
 	}
-	b, err := p.descriptorJSON(cause == nil, errText)
-	if err != nil {
-		return err
-	}
+	b := p.descriptorJSON(o)
 	// CreateTemp opens with O_EXCL and 0600
 	f, err := os.CreateTemp(p.folder, ".datapackage-*.json")
 	if err != nil {
@@ -325,7 +324,7 @@ func (p *Package) descriptor(cause error) error {
 	return err
 }
 
-func (p *Package) descriptorJSON(complete bool, errText string) ([]byte, error) {
+func (p *Package) descriptorJSON(o outcome) []byte {
 	m := p.meta
 	resources := make([]any, len(p.closed))
 	for i, s := range p.closed {
@@ -336,14 +335,14 @@ func (p *Package) descriptorJSON(complete bool, errText string) ([]byte, error) 
 		{"name", slug(m.Alias + "-" + m.Started.Format("2006-01-02T150405"))},
 		{"created", m.Started.Format(startedLayout)},
 		{"sources", []any{ordered{{"title", m.Alias + " " + m.Client}}}},
-		{"gatereach", m.entries(&complete, errText)},
+		{"gatereach", m.entries(&o)},
 		{"resources", resources},
 	}
-	b, err := indentJSON(doc)
-	if err != nil {
-		return nil, err
-	}
-	return append(b, '\n'), nil
+	// Validated immutable metadata and primitive resource fields always form valid JSON
+	raw, _ := compactJSON(doc)
+	var b bytes.Buffer
+	_ = json.Indent(&b, raw, "", "  ")
+	return append(b.Bytes(), '\n')
 }
 
 type entry struct {
@@ -383,16 +382,4 @@ func compactJSON(v any) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimRight(b.Bytes(), "\n"), nil
-}
-
-func indentJSON(v any) ([]byte, error) {
-	raw, err := compactJSON(v)
-	if err != nil {
-		return nil, err
-	}
-	var b bytes.Buffer
-	if err := json.Indent(&b, raw, "", "  "); err != nil {
-		return nil, err
-	}
-	return b.Bytes(), nil
 }

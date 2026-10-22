@@ -14,10 +14,17 @@ import (
 // Write is called once per record and Close once at the end
 type Sink interface {
 	Write(r record.Record) error
+	// stop names what ended a normal run early
 	// err holds the cause when the run failed
 	// The returned error means the output itself failed
-	Close(err error) error
+	Close(stop Stop, err error) error
 }
+
+// Why a normal end came before the source ran out
+// Empty for every other end
+type Stop string
+
+const StopBudget Stop = "budget" // The budget ran out
 
 // Recorded the same way in datapackage.json and the Arrow schema metadata
 type Meta struct {
@@ -27,6 +34,10 @@ type Meta struct {
 	User    string
 	Query   string
 	Limit   int
+	// Budget in the source's unit
+	// 0 means none
+	Max     float64
+	Unit    string
 	Write   bool
 	Follow  bool
 	Started time.Time
@@ -35,23 +46,40 @@ type Meta struct {
 // Seconds with the local time zone offset
 const startedLayout = "2006-01-02T15:04:05-07:00"
 
-// A nil complete gives only the start details without the run's outcome
-func (m Meta) entries(complete *bool, errText string) ordered {
-	out := ordered{{"version", m.Version}, {"alias", m.Alias}, {"client", m.Client}}
+// The run's outcome
+// The Arrow metadata leaves it out since it goes out before the run ends
+type outcome struct {
+	complete bool
+	errText  string
+	stop     Stop
+}
+
+// 1. The outcome comes right after version
+// 2. The query goes last so its length never pushes the outcome out of the prefix
+// A reader that cuts the object at a length still sees whether the run was complete
+// A nil outcome gives only the start details
+func (m Meta) entries(o *outcome) ordered {
+	out := ordered{{"version", m.Version}}
+	if o != nil {
+		out = append(out, entry{"complete", o.complete})
+		if o.errText != "" {
+			out = append(out, entry{"error", o.errText})
+		}
+		if o.stop != "" {
+			out = append(out, entry{"stopped", o.stop})
+		}
+	}
+	out = append(out, entry{"alias", m.Alias}, entry{"client", m.Client})
 	if m.User != "" {
 		out = append(out, entry{"user", m.User})
 	}
-	out = append(out, ordered{
-		{"query", m.Query}, {"limit", m.Limit}, {"write", m.Write}, {"follow", m.Follow},
-		{"started", m.Started.Format(startedLayout)},
+	out = append(out, entry{"limit", m.Limit})
+	if m.Max > 0 {
+		out = append(out, entry{"max", m.Max}, entry{"unit", m.Unit})
+	}
+	return append(out, ordered{
+		{"write", m.Write}, {"follow", m.Follow}, {"started", m.Started.Format(startedLayout)}, {"query", m.Query},
 	}...)
-	if complete != nil {
-		out = append(out, entry{"complete", *complete})
-	}
-	if errText != "" {
-		out = append(out, entry{"error", errText})
-	}
-	return out
 }
 
 func FormatNames() []string {
@@ -108,7 +136,8 @@ func (j *JSONLines) WriteRaw(line []byte) error {
 	return nil
 }
 
-func (j *JSONLines) Close(err error) error {
+// The CLI prints why a budget stopped the run so stop adds nothing here
+func (j *JSONLines) Close(_ Stop, err error) error {
 	flushErr := j.w.Flush()
 	suffix := ""
 	if err != nil || flushErr != nil {

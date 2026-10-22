@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 
@@ -39,6 +40,14 @@ func TestQuery_Errors(t *testing.T) {
 		want want
 	}{
 		{"unknown alias", []string{"q", "nope", "GET k"}, want{1, "unknown alias: nope"}},
+		{
+			"an unsupported client fails before preparation", []string{"q", "invalid", "GET k"},
+			want{1, "unsupported client: missing"},
+		},
+		{
+			"a tunnel that cannot start fails preparation", []string{"q", "r", "GET k"},
+			want{1, "tunnel couldn't run"},
+		},
 		{"write blocked before the tunnel opens", []string{"q", "r", "FLUSHALL"},
 			want{1, "command blocked in read-only mode: FLUSHALL"}},
 		{"query from --file", []string{"q", "r", "--file", file}, want{1, "command blocked in read-only mode: FLUSHALL"}},
@@ -92,7 +101,9 @@ func TestQuery_Errors(t *testing.T) {
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			useConfig(t, "[conns.r]\nclient = \"redis\"\nport = 1\n\n[conns.r.tunnel]\ntype = \"tsh\"\ntarget = \"x\"\n\n"+
-				"[conns.a]\nclient = \"athena\"\nworkgroup = \"primary\"\nwrite = true\n")
+				"[conns.a]\nclient = \"athena\"\nworkgroup = \"primary\"\nwrite = true\n"+
+				"[conns.invalid]\nclient = \"missing\"\n"+
+				"[tunnels.tsh]\nbin = "+strconv.Quote(filepath.Join(t.TempDir(), "missing"))+"\n")
 			code, _, errw := run(tc.args...)
 			assert.Equal(t, tc.want.code, code)
 			assert.Contains(t, errw, tc.want.err)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -112,7 +113,7 @@ func TestJSONLines(t *testing.T) {
 				require.NoError(t, raw.WriteRaw([]byte(`{"raw":1}`)))
 			}
 			assert.Equal(t, tc.want.early, out.String())
-			closeErr := s.Close(tc.args.runErr)
+			closeErr := s.Close("", tc.args.runErr)
 			assert.Equal(t, tc.want.closeErr, closeErr != nil, "%v", closeErr)
 			assert.Equal(t, tc.want.out, out.String())
 			assert.Equal(t, tc.want.stderr, errw.String())
@@ -125,27 +126,42 @@ func TestGet(t *testing.T) {
 	names := []string{"i", "f", "s", "b", "o"}
 	typed := r(names, int64(1), 1.5, "NULL", true, map[string]any{"k": int64(1)})
 	nulls := r(names, nil, nil, nil, nil, nil)
+	startKeys := []string{"alias", "client", "user", "limit", "write", "follow", "started", "query"}
+	budgetKeys := []string{"alias", "client", "user", "limit", "max", "unit", "write", "follow", "started", "query"}
+	startMeta := `"alias":"db","client":"mysql","user":"viewer","limit":10,` +
+		`"write":false,"follow":false,"started":"2026-10-15T10:00:00+00:00","query":"select 1"}`
+	type args struct {
+		format  string
+		records []record.Record
+		max     float64
+		unit    string
+		stop    sinks.Stop
+		runErr  error
+	}
 	type want struct {
 		complete bool
 		errText  string
-		stderr   string
-		rows     []float64
+		stopped  string
+		// Keys of the gatereach object in the descriptor in file order
+		keys   []string
+		stderr string
+		rows   []float64
 		// Arrow type per column name
 		types map[string]string
+		// The gatereach value in the Arrow schema metadata
+		meta string
 		// Values of the arrow column s with nil for NULL
 		s []any
 		// File content in the csv format
 		csv string
 	}
 	tcs := []struct {
-		name    string
-		format  string
-		records []record.Record
-		runErr  error
-		want    want
+		name string
+		args args
+		want want
 	}{
-		{"arrow keeps types and nulls", "arrow", []record.Record{typed, nulls}, nil, want{
-			complete: true, rows: []float64{2},
+		{"arrow keeps types and nulls", args{format: "arrow", records: []record.Record{typed, nulls}}, want{
+			complete: true, keys: append([]string{"version", "complete"}, startKeys...), rows: []float64{2},
 			types: map[string]string{
 				"i": "int64",
 				"f": "float64",
@@ -153,50 +169,82 @@ func TestGet(t *testing.T) {
 				"b": "bool",
 				"o": "extension<arrow.json[storage_type=utf8]>",
 			},
-			s: []any{"NULL", nil},
+			meta: `{"version":"0.1.0",` + startMeta,
+			s:    []any{"NULL", nil},
 		}},
 		{
 			"csv marks null and writes nested values as JSON",
-			"csv",
-			[]record.Record{r([]string{"n", "a", "f", "b", "i"}, nil, []any{int64(1), "x"}, 2.0, true, int64(3))},
-			nil,
+			args{format: "csv", records: []record.Record{
+				r([]string{"n", "a", "f", "b", "i"}, nil, []any{int64(1), "x"}, 2.0, true, int64(3)),
+			}},
 			want{
-				complete: true, rows: []float64{1}, csv: "n,a,f,b,i\n\\N,\"[1,\"\"x\"\"]\",2.0,true,3\n",
+				complete: true, keys: append([]string{"version", "complete"}, startKeys...), rows: []float64{1},
+				csv: "n,a,f,b,i\n\\N,\"[1,\"\"x\"\"]\",2.0,true,3\n",
 			},
 		},
 		{
-			"a failed run keeps rows and marks the package incomplete",
-			"arrow",
-			[]record.Record{r([]string{"a"}, int64(1))},
-			errors.New("tool failed"),
+			"a failed run keeps rows and puts the outcome before the query",
+			args{format: "arrow", records: []record.Record{r([]string{"a"}, int64(1))}, runErr: errors.New("tool failed")},
 			want{
-				errText: "tool failed", stderr: "stopped by a failure, saved only what arrived", rows: []float64{1},
+				errText: "tool failed", keys: append([]string{"version", "complete", "error"}, startKeys...),
+				stderr: "stopped by a failure, saved only what arrived", rows: []float64{1},
 			},
 		},
-		{"an empty csv run writes one empty resource", "csv", nil, nil, want{complete: true, rows: []float64{0}, csv: ""}},
-		{"an empty arrow run is a readable stream", "arrow", nil, nil, want{
-			complete: true, rows: []float64{0}, types: map[string]string{},
+		{
+			"a stop at --max is complete and says the budget stopped it",
+			args{
+				format: "arrow", records: []record.Record{typed}, max: 2.5,
+				unit: "read capacity units", stop: sinks.StopBudget,
+			},
+			want{
+				complete: true, stopped: "budget", keys: append([]string{"version", "complete", "stopped"}, budgetKeys...),
+				rows: []float64{1}, types: map[string]string{
+					"i": "int64",
+					"f": "float64",
+					"s": "utf8",
+					"b": "bool",
+					"o": "extension<arrow.json[storage_type=utf8]>",
+				},
+				meta: `{"version":"0.1.0","alias":"db","client":"mysql","user":"viewer","limit":10,` +
+					`"max":2.5,"unit":"read capacity units","write":false,"follow":false,` +
+					`"started":"2026-10-15T10:00:00+00:00","query":"select 1"}`,
+				s: []any{"NULL"},
+			},
+		},
+		{"an empty csv run writes one empty resource", args{format: "csv"}, want{
+			complete: true, keys: append([]string{"version", "complete"}, startKeys...), rows: []float64{0}, csv: "",
 		}},
-		{"fields in another order or missing land in their columns", "csv", []record.Record{
+		{"an empty arrow run is a readable stream", args{format: "arrow"}, want{
+			complete: true, keys: append([]string{"version", "complete"}, startKeys...), rows: []float64{0},
+			types: map[string]string{}, meta: `{"version":"0.1.0",` + startMeta,
+		}},
+		{"fields in another order or missing land in their columns", args{format: "csv", records: []record.Record{
 			r([]string{"a", "b"}, "1", "2"), r([]string{"b", "a"}, "3", "4"), r([]string{"a"}, "5"),
-		}, nil, want{complete: true, rows: []float64{3}, csv: "a,b\n1,2\n4,3\n5,\\N\n"}},
+		}}, want{
+			complete: true, keys: append([]string{"version", "complete"}, startKeys...), rows: []float64{3},
+			csv: "a,b\n1,2\n4,3\n5,\\N\n",
+		}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dir := filepath.Join(t.TempDir(), "out")
 			var out, errw bytes.Buffer
-			s, err := sinks.Get(dir, tc.format, meta, &out, &errw)
+			m := meta
+			m.Max, m.Unit = tc.args.max, tc.args.unit
+			s, err := sinks.Get(dir, tc.args.format, m, &out, &errw)
 			require.NoError(t, err)
-			for _, rec := range tc.records {
+			for _, rec := range tc.args.records {
 				require.NoError(t, s.Write(rec))
 			}
-			require.NoError(t, s.Close(tc.runErr))
+			require.NoError(t, s.Close(tc.args.stop, tc.args.runErr))
 
 			d := readDescriptor(t, dir)
 			run := d["gatereach"].(map[string]any)
 			assert.Equal(t, tc.want.complete, run["complete"])
 			assert.Equal(t, tc.want.errText, text(run["error"]))
+			assert.Equal(t, tc.want.stopped, text(run["stopped"]))
+			assert.Equal(t, tc.want.keys, gatereachKeys(t, dir))
 			assert.Contains(t, errw.String(), tc.want.stderr)
 			if tc.want.complete {
 				assert.Equal(t, filepath.Join(dir, "datapackage.json")+"\n", out.String())
@@ -219,17 +267,39 @@ func TestGet(t *testing.T) {
 				}
 				assert.Equal(t, tc.want.types, types)
 				gm, _ := schema.Metadata().GetValue("gatereach")
-				assert.Equal(t, `{"version":"0.1.0","alias":"db","client":"mysql","user":"viewer","query":"select 1",`+
-					`"limit":10,"write":false,"follow":false,"started":"2026-10-15T10:00:00+00:00"}`, gm)
+				assert.Equal(t, tc.want.meta, gm)
 				assert.Equal(t, tc.want.s, stringColumn(schema, batches, "s"))
 			}
-			if tc.format == "csv" {
+			if tc.args.format == "csv" {
 				b, err := os.ReadFile(filepath.Join(dir, "result.csv"))
 				require.NoError(t, err)
 				assert.Equal(t, tc.want.csv, string(b))
 			}
 		})
 	}
+}
+
+// Keys of the descriptor's gatereach object in the order the file holds them
+func gatereachKeys(t *testing.T, dir string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "datapackage.json"))
+	require.NoError(t, err)
+	var d struct {
+		Gatereach json.RawMessage `json:"gatereach"`
+	}
+	require.NoError(t, json.Unmarshal(b, &d))
+	dec := json.NewDecoder(bytes.NewReader(d.Gatereach))
+	_, err = dec.Token()
+	require.NoError(t, err)
+	var keys []string
+	for dec.More() {
+		k, err := dec.Token()
+		require.NoError(t, err)
+		keys = append(keys, k.(string))
+		var v any
+		require.NoError(t, dec.Decode(&v))
+	}
+	return keys
 }
 
 func stringColumn(schema *arrow.Schema, batches []arrow.RecordBatch, name string) []any {
@@ -322,6 +392,85 @@ func TestCheckFolder(t *testing.T) {
 	}
 }
 
+func TestGet_InvalidMetadata(t *testing.T) {
+	type args struct {
+		max  float64
+		unit string
+	}
+	// Validation runs before any format work so one format covers both
+	for _, tc := range []struct {
+		name string
+		args args
+	}{
+		{"infinite maximum", args{max: math.Inf(1), unit: "records"}},
+		{"negative infinite maximum", args{max: math.Inf(-1), unit: "records"}},
+		{"not a number", args{max: math.NaN(), unit: "records"}},
+		{"negative maximum", args{max: -1, unit: "records"}},
+		{"missing unit", args{max: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := meta
+			m.Max, m.Unit = tc.args.max, tc.args.unit
+			dir := filepath.Join(t.TempDir(), "out")
+			s, err := sinks.Get(dir, "csv", m, &bytes.Buffer{}, &bytes.Buffer{})
+			assert.Error(t, err)
+			assert.Nil(t, s)
+			_, statErr := os.Stat(dir)
+			assert.ErrorIs(t, statErr, os.ErrNotExist)
+		})
+	}
+}
+
+func TestGet_DescriptorReplacementFailure(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "out")
+	var out bytes.Buffer
+	s, err := sinks.Get(dir, "csv", meta, &out, &bytes.Buffer{})
+	require.NoError(t, err)
+	path := filepath.Join(dir, "datapackage.json")
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Mkdir(path, 0o700))
+	assert.Error(t, s.Close("", nil))
+	temps, err := filepath.Glob(filepath.Join(dir, ".datapackage-*.json"))
+	require.NoError(t, err)
+	assert.Empty(t, temps)
+	assert.Empty(t, out.String())
+}
+
+func TestGet_SegmentOpenFailure(t *testing.T) {
+	type args struct {
+		format  string
+		file    string
+		records []record.Record
+	}
+	records := []record.Record{r([]string{"a"}, "x")}
+	for _, tc := range []struct {
+		name string
+		args args
+	}{
+		{"empty arrow run", args{format: "arrow", file: "result.arrows"}},
+		{"empty csv run", args{format: "csv", file: "result.csv"}},
+		{"buffered arrow run", args{format: "arrow", file: "result.arrows", records: records}},
+		{"buffered csv run", args{format: "csv", file: "result.csv", records: records}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := filepath.Join(t.TempDir(), "out")
+			s, err := sinks.Get(dir, tc.args.format, meta, &bytes.Buffer{}, &bytes.Buffer{})
+			require.NoError(t, err)
+			for _, rec := range tc.args.records {
+				require.NoError(t, s.Write(rec))
+			}
+			require.NoError(t, os.Mkdir(filepath.Join(dir, tc.args.file), 0o700))
+			assert.Error(t, s.Close("", nil))
+			run := readDescriptor(t, dir)["gatereach"].(map[string]any)
+			assert.Equal(t, false, run["complete"])
+			assert.NotEmpty(t, run["error"])
+		})
+	}
+}
+
 // An empty folder made by someone else ends up private like a new one
 func TestGet_ExistingEmptyFolderBecomesPrivate(t *testing.T) {
 	t.Parallel()
@@ -330,7 +479,7 @@ func TestGet_ExistingEmptyFolderBecomesPrivate(t *testing.T) {
 	require.NoError(t, os.Chmod(dir, 0o755))
 	s, err := sinks.Get(dir, "csv", meta, &bytes.Buffer{}, &bytes.Buffer{})
 	require.NoError(t, err)
-	require.NoError(t, s.Close(nil))
+	require.NoError(t, s.Close("", nil))
 	fi, err := os.Stat(dir)
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o700), fi.Mode().Perm())

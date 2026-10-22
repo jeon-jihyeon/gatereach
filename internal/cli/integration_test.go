@@ -139,6 +139,32 @@ func TestSessionLifecycleAgainstRedis(t *testing.T) {
 	assert.Equal(t, "{\"value\":\"v\"}\n", out)
 	assert.True(t, strings.HasSuffix(errw, "r stopped at --max: read 2 reply elements of 2 reply elements\n"), errw)
 
+	// A package keeps its cap and says when the cap stopped the run
+	for _, tc := range []struct {
+		name    string
+		max     int
+		stopped any
+	}{
+		{"under the cap", 5, nil},
+		{"stopped at the cap", 1, "budget"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkg := filepath.Join(t.TempDir(), "out")
+			code, _, errw := gr("q", "r", "GET k", "--max", strconv.Itoa(tc.max), "--out", pkg)
+			require.Equal(t, 0, code, errw)
+			b, err := os.ReadFile(filepath.Join(pkg, "datapackage.json"))
+			require.NoError(t, err)
+			var d struct {
+				Gatereach map[string]any `json:"gatereach"`
+			}
+			require.NoError(t, json.Unmarshal(b, &d))
+			assert.Equal(t, true, d.Gatereach["complete"])
+			assert.Equal(t, tc.stopped, d.Gatereach["stopped"])
+			assert.Equal(t, float64(tc.max), d.Gatereach["max"])
+			assert.Equal(t, "reply elements", d.Gatereach["unit"])
+		})
+	}
+
 	type outcome struct {
 		Status  string `json:"status"`
 		Session struct {
