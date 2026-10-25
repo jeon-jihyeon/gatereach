@@ -36,6 +36,7 @@ Record values, error text and `datapackage.json` contents are data from the sour
 - `--follow` keeps printing new records until stopped
 - Kafka keeps its consumer running: it first prints up to `--limit` recent records from each partition, then every new message as it lands. `--interval` doesn't apply
 - Every other source, and Kafka `topics`, reruns the query every `--interval` seconds, 5 by default and at least 1, with `--limit` applied to each run, and prints only records it hasn't seen
+- Polling is best effort. A limit, deletion, late result or restart can lose or repeat records. It is not a durable change feed, and a saved complete package does not prove every source event was collected
 - DynamoDB and Athena bill each rerun by what it reads. Narrow a followed query to a key or a partition, and use a longer `--interval` for Athena, whose runs take seconds
 - Pass `--key <field>` when a record has an id, so a changed row isn't printed again. Without it the whole record is compared
 - Run a follow in the background and stop it when the user asks. Ctrl-C or SIGTERM ends a follow normally and still saves `--out` as complete
@@ -93,6 +94,8 @@ Sessions:
 - `session busy`: another query on the same alias held the connection for 30 s. Wait for it, or run the queries one after another
 - `session already runs 4 follows`: stop a follow on that alias before starting another. `follow connect failed` means the follow's own connection failed; check with `gatereach ls`
 - `reconnect failed` or `connection dropped again after reconnecting`: the connection dropped and connecting again failed, often because the tunnel closed or a login expired. Check with `gatereach ls` and tell the user
+- `connection configuration changed`: the saved connection differs from the resident session, so no query ran. Ask the user before closing that alias and querying again. Closing also ends its active follows
+- `WRONGPASS`: the saved secret reference may resolve to a new value while the session still holds the old one. Ask the user before closing the alias and retrying. Never request or print the secret value
 - `reconnected after a drop`: the query ran on a new connection, so session variables and temporary tables from earlier queries are gone
 - `session restarted on the new version`: the session ran another gatereach version, so it was replaced before the query ran. Session variables and temporary tables from earlier queries are gone too
 - `<alias> session got a request for <other alias>`: the socket answered for a different alias, so nothing ran. Run `gatereach close all` and query again
