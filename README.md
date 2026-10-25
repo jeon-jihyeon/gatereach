@@ -180,6 +180,8 @@ gatereach add acme-athena --client athena --profile dev --region us-east-1 --wor
 
 A tunnel and a session keep running after gatereach exits. The session holds one connection per alias and serves queries over a Unix socket in a folder only your user can open. So the next query skips the TLS and login round trips, and Teleport records one session instead of one per query.
 
+Changing a saved connection makes its resident session refuse the next query. Close that alias explicitly before querying with the new settings; this also ends its active follows. A secret value rotated behind an unchanged reference is not a config change and needs the same close and retry to be resolved again.
+
 Their logs go to `logs/ALIAS-HASH.log` and `logs/ALIAS-HASH.session.log` next to the config file. `ALIAS` is the alias with every run of characters other than letters, digits, `.`, `-` and `_` replaced by one `_`. `HASH` is the alias's crc32, so two aliases never share a log.
 
 ## Output
@@ -226,6 +228,7 @@ DIR/result-2.arrows    started when records change shape, so nothing is dropped
 
 - Kafka keeps its consumer open: it first prints up to `--limit` recent records from each partition, then every new message
 - Every other source, and Kafka `topics`, reruns the query every `--interval` seconds with `--limit` applied to each run, and prints only records it hasn't seen, compared by `--key` or by the whole record
+- Polling can miss or repeat records after limits, changes, deletion or restart. It is not a durable change feed, and a complete saved package does not certify that every source event was collected
 - DynamoDB and Athena bill each rerun by what it reads, so narrow the query to a key or a partition before following it. `--max` puts a cap on the total
 
 ## Budget and timeout
@@ -274,6 +277,8 @@ With `--write`, MySQL skips the rollback, so a transaction can span several `--w
 MySQL's one-statement check reads the query both with and without backslash escapes, so a server mode like `NO_BACKSLASH_ESCAPES` or ANSI quoting can't hide a second statement. That means a string with a backslash-escaped quote before a semicolon, like `'it\'s; done'`, is refused too. Write the quote doubled instead: `'it''s; done'`.
 
 This is a guard against mistakes, not a security boundary. A stored procedure, a function with side effects, a `TEMPORARY` table, or a command it doesn't know about can still write. Only a read-only database account guarantees no writes, so use one where you can.
+
+Keep source account permissions and the host's access controls in place. An agent with the same OS user can otherwise change config or use another client, socket or tunnel directly. gatereach does not classify or prevent sensitive result disclosure.
 
 Limits are best effort too. MySQL caps each statement with `sql_select_limit` and stops reading at `--limit`, and DynamoDB and Athena stop paging there. Athena still runs the whole query and bills the data it scans, so add a `LIMIT` or a partition filter to cut the scan. `--max` can only stop the work that comes next, since a source reports its cost after the work is done. Redis bounds whole-collection and range reads such as `HGETALL`, `SMEMBERS` and `LRANGE` by `--limit`; use `HSCAN`, `SSCAN` or `ZSCAN` to page through the rest. A Kafka topic name reads up to `--limit` recent records sampled across partitions, not strictly the newest of the whole topic.
 
