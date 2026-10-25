@@ -2,12 +2,10 @@ package tunnels
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/jeon-jihyeon/gatereach/internal/config"
 )
@@ -50,22 +48,21 @@ func TestTshDiscover(t *testing.T) {
 	}
 	tcs := []struct {
 		name string
-		// Body of a fake tsh, empty for a binary that doesn't exist
-		script string
-		want   want
+		bin  string
+		want want
 	}{
-		{"lists the databases", `echo '[{"metadata":{"name":"db-1"},"spec":{"protocol":"redis"}}]'`,
-			want{targets: []Target{{Target: "db-1", Name: "db-1", Client: "redis"}}}},
-		{"a failed tsh points at the login", "echo 'not logged in' >&2; exit 1",
+		{"lists the databases", filepath.Join("testdata", "tsh-list"),
+			want{targets: []Target{{Target: "acme", Name: "acme", Client: "redis"}}}},
+		{"a failed tsh points at the login", filepath.Join("testdata", "tsh-fail"),
 			want{err: "tsh db ls failed: check the tsh login\nnot logged in"}},
 		{"a missing tsh gives the cause", "", want{err: "tsh db ls couldn't run"}},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			bin := filepath.Join(t.TempDir(), "tsh")
-			if tc.script != "" {
-				require.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\n"+tc.script+"\n"), 0o700))
+			bin := tc.bin
+			if bin == "" {
+				bin = filepath.Join(t.TempDir(), "tsh")
 			}
 			got, err := tsh{tool: config.Tool{Bin: bin}}.Discover()
 			assert.Equal(t, tc.want.targets, got)

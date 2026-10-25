@@ -1,0 +1,4 @@
+#!/bin/sh
+[ "$#" -eq 4 ] && [ "$1" = db ] && [ "$2" = ls ] && [ "$3" = --format ] && [ "$4" = json ] || exit 2
+printf '%s\n' 'not logged in' >&2
+exit 1
