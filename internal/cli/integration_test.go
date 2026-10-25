@@ -168,8 +168,10 @@ func TestSessionLifecycleAgainstRedis(t *testing.T) {
 	type outcome struct {
 		Status  string `json:"status"`
 		Session struct {
-			Rows  int  `json:"rows"`
-			Spent bool `json:"spent"`
+			Rows          int    `json:"rows"`
+			Spent         bool   `json:"spent"`
+			ConfigChanged bool   `json:"config_changed"`
+			Error         string `json:"error"`
 		} `json:"session"`
 	}
 	for _, tc := range []struct {
@@ -238,6 +240,32 @@ func TestSessionLifecycleAgainstRedis(t *testing.T) {
 	assert.Equal(t, 130, ee.ExitCode())
 	assert.Contains(t, blockOutput.String(), `"status":"interrupted"`)
 	assert.NotContains(t, blockOutput.String(), `"session":`)
+
+	current, err := os.ReadFile(cfg)
+	require.NoError(t, err)
+	changed := strings.Replace(string(current), "write = true", "write = false", 1)
+	require.NoError(t, os.WriteFile(cfg, []byte(changed), 0o600))
+	code, out, errw = gr("q", "r", "GET k", "--events")
+	assert.Equal(t, 1, code)
+	assert.Contains(t, errw, "connection configuration changed")
+	assert.NotContains(t, errw, "restarted")
+	assert.NotContains(t, out, `"type":"record"`)
+	assert.Contains(t, out, `"config_changed":true`)
+	var drift outcome
+	require.NoError(t, json.Unmarshal([]byte(out), &drift))
+	assert.True(t, drift.Session.ConfigChanged)
+	assert.Zero(t, drift.Session.Rows)
+	assert.Equal(t,
+		"r connection configuration changed\nclose r before querying its new configuration", drift.Session.Error)
+	assert.True(t, session.Alive("r"))
+	code, _, errw = gr("close", "r")
+	require.Equal(t, 0, code, errw)
+	code, out, errw = gr("q", "r", "GET k")
+	require.Equal(t, 0, code, errw)
+	assert.Equal(t, "{\"value\":\"v\"}\n", out)
+	code, _, errw = gr("q", "r", "SET k changed", "--write")
+	assert.Equal(t, 1, code)
+	assert.Contains(t, errw, "doesn't allow --write")
 
 	code, out, _ = gr("close", "r")
 	assert.Equal(t, 0, code)
