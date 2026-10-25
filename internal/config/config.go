@@ -2,6 +2,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -47,6 +49,12 @@ type Conn struct {
 	OutputLocation string `toml:"output_location"`
 	// Empty means AwsDataCatalog
 	Catalog string `toml:"catalog"`
+}
+
+func (c Conn) Fingerprint() string {
+	// Connection fields contain only JSON supported values
+	data, _ := json.Marshal(c)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
 // Settings of a tunnel tool

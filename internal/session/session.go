@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -46,7 +47,8 @@ const (
 	// Follows one session runs at once since each holds its own source connection
 	maxFollows = 4
 	// Shortest follow interval as the CLI also checks
-	minInterval = time.Second
+	minInterval     = time.Second
+	protocolVersion = "config1:"
 )
 
 type op string
@@ -61,6 +63,7 @@ type Request struct {
 	Op op `json:"op,omitempty"`
 	// A version other than the session binary's is refused so a new binary takes the session over
 	Version string `json:"version,omitempty"`
+	Config  string `json:"config,omitempty"`
 	// Checked so a query never reaches another alias's session even when socket names collide
 	Alias    string        `json:"alias"`
 	Query    string        `json:"query,omitempty"`
@@ -82,7 +85,8 @@ type End struct {
 	// The dropped connection was reopened so session variables and temporary tables were reset
 	Reconnected bool `json:"reconnected,omitempty"`
 	// The session version differs from the request's so nothing ran
-	Outdated bool `json:"outdated,omitempty"`
+	Outdated      bool `json:"outdated,omitempty"`
+	ConfigChanged bool `json:"config_changed,omitempty"`
 	// What the source read over the request when Max is set
 	Used float64 `json:"used,omitempty"`
 	// Used reached Max and ended the request
@@ -92,6 +96,8 @@ type End struct {
 // The session runs on another binary version
 // The caller restarts the session and sends the request again
 var ErrOutdated = errors.New("session version differs")
+
+var ErrConfigChanged = errors.New("connection configuration changed")
 
 // Value ranges that also stop requests sent without the CLI
 func (r Request) check() error {
@@ -359,6 +365,7 @@ func waitGone(alias string, deadline time.Time) bool {
 // 1. A failure the session reported comes back with its End
 // 2. A failure on the way comes back with an empty End since no End arrived
 func Query(ctx context.Context, req Request, emit func(line []byte) error) (End, error) {
+	req.Version = protocolVersion + req.Version
 	c, err := dial(req.Alias)
 	if err != nil {
 		return End{}, fmt.Errorf("%s couldn't reach the session: %w", req.Alias, err)
@@ -404,6 +411,8 @@ func parseEnd(alias string, line []byte) (End, error) {
 	switch {
 	case end.Outdated:
 		return end, fmt.Errorf("%w: %s", ErrOutdated, end.Error)
+	case end.ConfigChanged:
+		return end, fmt.Errorf("%w: %s", ErrConfigChanged, end.Error)
 	case end.Error != "":
 		return end, errors.New(end.Error)
 	}
@@ -413,11 +422,12 @@ func parseEnd(alias string, line []byte) (End, error) {
 type server struct {
 	alias string
 	// Version of the binary that started the session
-	version  string
-	conn     config.Conn
-	kind     clients.Kind
-	password string
-	ln       *net.UnixListener
+	version     string
+	conn        config.Conn
+	fingerprint string
+	kind        clients.Kind
+	password    string
+	ln          *net.UnixListener
 
 	// The one connection single reads use
 	// The size 1 channel sets the turn and client is only swapped inside a turn
@@ -463,7 +473,8 @@ func serve(ctx context.Context, alias, version string, conn config.Conn, w waits
 	}
 	s := &server{
 		alias: alias, version: version, conn: conn, kind: kind, password: password, client: client,
-		waits: w, turn: make(chan struct{}, 1), follows: make(chan struct{}, maxFollows), quit: make(chan struct{}),
+		fingerprint: conn.Fingerprint(),
+		waits:       w, turn: make(chan struct{}, 1), follows: make(chan struct{}, maxFollows), quit: make(chan struct{}),
 	}
 	defer func() { _ = s.client.Close() }()
 	// bind takes no mode so the umask alone keeps the socket file private
@@ -551,8 +562,21 @@ func (s *server) handle(parent context.Context, c *net.UnixConn) {
 		s.shutdown()
 		return
 	}
-	if req.Version != s.version {
-		writeEnd(c, End{Error: fmt.Sprintf("%s session version %s differs from request version %s", s.alias, s.version, req.Version), Outdated: true})
+	if req.Version != protocolVersion+s.version {
+		message := fmt.Sprintf("%s session version %s differs from request version %s",
+			s.alias, s.version, strings.TrimPrefix(req.Version, protocolVersion))
+		if !strings.HasPrefix(req.Version, protocolVersion) {
+			message = fmt.Sprintf("%s session uses a different query protocol", s.alias)
+		}
+		writeEnd(c, End{Error: message, Outdated: true})
+		return
+	}
+	if req.Config != s.fingerprint {
+		writeEnd(c, End{
+			Error: fmt.Sprintf("%s connection configuration changed\nclose %s before querying its new configuration",
+				s.alias, s.alias),
+			ConfigChanged: true,
+		})
 		return
 	}
 	// The query is canceled when the sender closes the connection
@@ -594,6 +618,9 @@ func (s *server) handle(parent context.Context, c *net.UnixConn) {
 func (s *server) runQuery(ctx context.Context, req Request, emit clients.Emit) (End, error) {
 	if err := req.check(); err != nil {
 		return End{}, err
+	}
+	if req.Write && !s.conn.Write {
+		return End{}, fmt.Errorf("%s doesn't allow --write", s.alias)
 	}
 	if err := s.kind.Check(req.Query, req.Write); err != nil {
 		return End{}, err

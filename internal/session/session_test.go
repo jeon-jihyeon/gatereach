@@ -97,6 +97,9 @@ func serveMocks(t *testing.T, busy time.Duration, check func(string, bool) error
 func serveConn(t *testing.T, conn config.Conn, w waits, check func(string, bool) error, cs ...*mocks.MockClient) {
 	t.Helper()
 	useConfig(t)
+	text, err := config.Render(testAlias, conn)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(config.Path(), []byte(text), 0o600))
 	clients.Kinds["mock"] = mockKind(check, cs...)
 	t.Cleanup(func() { delete(clients.Kinds, "mock") })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -149,6 +152,11 @@ func query(ctx context.Context, req Request) ([]string, End, error) {
 	if req.Version == "" {
 		req.Version = testVersion
 	}
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, End{}, err
+	}
+	req.Config = cfg.Conns[testAlias].Fingerprint()
 	var lines []string
 	end, err := Query(ctx, req, func(line []byte) error {
 		lines = append(lines, string(line))
@@ -317,7 +325,10 @@ func TestRequest_Errors(t *testing.T) {
 	}{
 		{"another alias", `{"alias":"a_b","query":"x","limit":1}`, "a session got a request for a_b"},
 		{"unreadable request", "nope", "a session couldn't parse the request: invalid character"},
-		{"unknown op", `{"op":"drop","version":"1.0.0","alias":"a","query":"x","limit":1}`, "unknown op: drop"},
+		{"old query protocol", `{"version":"1.0.0","alias":"a","query":"x","limit":1}`,
+			"a session uses a different query protocol"},
+		{"unknown op", fmt.Sprintf(`{"op":"drop","version":%q,"config":%q,"alias":"a","query":"x","limit":1}`,
+			protocolVersion+testVersion, (config.Conn{Client: "mock"}).Fingerprint()), "unknown op: drop"},
 		{"request past 4 MiB", strings.Repeat("x", maxRequest+1),
 			"a session couldn't read the request: bufio.Scanner: token too long"},
 	}
@@ -481,7 +492,10 @@ func TestStopEndsASessionStuckWriting(t *testing.T) {
 	c, err := dial(testAlias)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
-	require.NoError(t, json.NewEncoder(c).Encode(Request{Version: testVersion, Alias: testAlias, Query: "x", Limit: 1}))
+	require.NoError(t, json.NewEncoder(c).Encode(Request{
+		Version: protocolVersion + testVersion, Config: (config.Conn{Client: "mock"}).Fingerprint(),
+		Alias: testAlias, Query: "x", Limit: 1,
+	}))
 	// Request delivery alone does not establish that Read reached the socket write
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
 	prefix := make([]byte, len(recordPrefix))
@@ -603,6 +617,10 @@ func TestDirFallback(t *testing.T) {
 // An Accept failure other than shutdown still cancels the follow and ends
 func TestAcceptFailureEndsAFollow(t *testing.T) {
 	useConfig(t)
+	conn := config.Conn{Client: "mock"}
+	text, err := config.Render(testAlias, conn)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(config.Path(), []byte(text), 0o600))
 	following := make(chan struct{})
 	// loop never uses the held connection itself so no calls are expected
 	held := mocks.NewMockClient(gomock.NewController(t))
@@ -619,6 +637,7 @@ func TestAcceptFailureEndsAFollow(t *testing.T) {
 	require.NoError(t, err)
 	s := &server{
 		alias: testAlias, version: testVersion, kind: mockKind(nil, follow), client: held,
+		conn: conn, fingerprint: conn.Fingerprint(),
 		waits: waits{busy: time.Second, request: time.Second}, turn: make(chan struct{}, 1),
 		follows: make(chan struct{}, maxFollows), quit: make(chan struct{}), ln: ln,
 	}
@@ -630,7 +649,12 @@ func TestAcceptFailureEndsAFollow(t *testing.T) {
 			Request{Alias: testAlias, Query: "x", Limit: 1, Follow: true, Interval: time.Second},
 		)
 	}()
-	<-following
+	select {
+	case <-following:
+	case <-time.After(2 * time.Second):
+		_ = ln.Close()
+		t.Fatal("the follow didn't start")
+	}
 	_ = ln.Close()
 	select {
 	case err := <-done:

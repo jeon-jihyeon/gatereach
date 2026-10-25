@@ -209,8 +209,7 @@ func (a *app) runQuery(o queryOptions, report *queryReport) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// Only the user turns writes on for an alias
-	// so an agent told to write by what it read can't do so through a read-only alias
+	// The saved permission is also checked by the resident session
 	if o.write && !c.Write {
 		return false, fmt.Errorf("%s doesn't allow --write\nset write = true for it in %s by hand", o.alias, config.Path())
 	}
@@ -261,7 +260,8 @@ func (a *app) runQuery(o queryOptions, report *queryReport) (bool, error) {
 	}
 	req := session.Request{
 		Version: version.Version, Alias: o.alias, Query: o.text, Write: o.write,
-		Limit: o.limit, Follow: o.follow, Interval: o.interval, Key: o.key, Max: maxAmount, Timeout: o.timeout,
+		Config: c.Fingerprint(),
+		Limit:  o.limit, Follow: o.follow, Interval: o.interval, Key: o.key, Max: maxAmount, Timeout: o.timeout,
 	}
 	emit := writer(sink)
 	end, runErr := a.send(ctx, req, func(line []byte) error {
